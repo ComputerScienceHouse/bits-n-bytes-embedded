@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 ################################################################################
-## Form generated from reading UI file 'form.ui'
+## Form generated from reading UI file 'main.ui'
 ##
 ## Created by: Qt User Interface Compiler version 6.7.3
 ##
@@ -15,26 +15,26 @@ from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QCursor,
     QFont, QFontDatabase, QGradient, QIcon,
     QImage, QKeySequence, QLinearGradient, QPainter,
     QPalette, QPixmap, QRadialGradient, QTransform)
-from PySide6.QtWidgets import (QApplication, QPushButton, QSizePolicy, QStackedWidget,
+from PySide6.QtWidgets import (QApplication, QListView, QSizePolicy, QStackedWidget,
     QWidget)
 
 class Ui_main(object):
     def setupUi(self, main):
         if not main.objectName():
             main.setObjectName(u"main")
-        main.resize(800, 600)
+        main.resize(1024, 600)
         self.Main = QStackedWidget(main)
         self.Main.setObjectName(u"Main")
-        self.Main.setGeometry(QRect(10, 30, 751, 551))
-        self.page = QWidget()
-        self.page.setObjectName(u"page")
-        self.pushButton = QPushButton(self.page)
-        self.pushButton.setObjectName(u"pushButton")
-        self.pushButton.setGeometry(QRect(340, 220, 100, 32))
-        self.Main.addWidget(self.page)
-        self.page_2 = QWidget()
-        self.page_2.setObjectName(u"page_2")
-        self.Main.addWidget(self.page_2)
+        self.Main.setGeometry(QRect(0, 0, 1024, 600))
+        self.Welcome = QWidget()
+        self.Welcome.setObjectName(u"Welcome")
+        self.Main.addWidget(self.Welcome)
+        self.Cart = QWidget()
+        self.Cart.setObjectName(u"Cart")
+        self.listView = QListView(self.Cart)
+        self.listView.setObjectName(u"listView")
+        self.listView.setGeometry(QRect(10, 60, 660, 540))
+        self.Main.addWidget(self.Cart)
 
         self.retranslateUi(main)
 
@@ -46,6 +46,5 @@ class Ui_main(object):
 
     def retranslateUi(self, main):
         main.setWindowTitle(QCoreApplication.translate("main", u"main", None))
-        self.pushButton.setText(QCoreApplication.translate("main", u"PushButton", None))
     # retranslateUi
 
