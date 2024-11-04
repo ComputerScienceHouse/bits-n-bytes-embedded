@@ -156,7 +156,7 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event) {
  * @param event_id
  * @param event_data
  */
-static void mqtt_event_handler_wrapper(void *handler_args, esp_event_base_t, int32_t event_id, void *event_data) {
+static void mqtt_event_handler_wrapper(void *handler_args, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     mqtt_event_handler((esp_mqtt_event_handle_t) event_data);
 }
 
@@ -248,7 +248,7 @@ void app_main(void)
     configure_pins();
 
     // Start the MQTT app
-    mqtt_app_start();;
+    mqtt_app_start();
 
     // Create the door status publishing task
     xTaskCreate(&publish_door_status_task, "publish_door_status_task", 2048, NULL, 5, NULL);
