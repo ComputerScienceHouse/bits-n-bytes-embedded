@@ -26,9 +26,6 @@
 #define PUBLISH_STATUS_DELAY_MS 1000
 #define DOOR_TRIGGER_DELAY_MS 1000
 
-#define WIFI_SSID "Isaac's iPhone 16 Pro"
-#define WIFI_PASS "shasta2004@"
-
 esp_mqtt_client_handle_t mqtt_client = NULL;
 
 /**
@@ -181,11 +178,71 @@ void mqtt_app_start() {
 }
 
 
+int retry_num = 0;
+static void wifi_event_handler(void * event_handler_arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+    if (event_id == WIFI_EVENT_STA_START) {
+        printf("Wifi connecting...\n");
+    } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
+        printf("Wifi connected\n");
+        retry_num = 0;
+    } else if(event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        printf("Wifi lost connection\n");
+        if(retry_num < 5) {
+            esp_wifi_connect();
+            retry_num++;
+            printf("Trying to reconnect... (%d)\n", retry_num);
+        }
+    } else if (event_id == IP_EVENT_STA_GOT_IP) {
+        printf("Wifi got IP\n");
+    }
+}
+
+/**
+ * Connect to Wifi
+ */
+void wifi_connection(const char* wifi_ssid, const char* wifi_pass) {
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t wifi_cfg_default = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&wifi_cfg_default);
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
+    wifi_config_t wifi_cfg = {
+            .sta.ssid = "",
+            .sta.password = "",
+    };
+    strcpy((char*)wifi_cfg.sta.ssid, wifi_ssid);
+    strcpy((char*)wifi_cfg.sta.password, wifi_pass);
+    esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_cfg);
+    esp_wifi_start();
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_connect();
+}
+
+
 /**
  * Main function, runs once on app start.
  */
 void app_main(void)
 {
+
+    // Get Wifi SSID and password
+    const char *wifi_ssid = getenv("ESP_WIFI_SSID");
+    if(wifi_ssid == NULL) {
+        printf("Wifi SSID not defined in env!");
+    }
+    const char *wifi_pass = getenv("ESP_WIFI_PASS");
+    if(wifi_pass == NULL) {
+        printf("Wifi password not defined in env!");
+    }
+    if (wifi_ssid == NULL || wifi_pass == NULL) {
+        exit(1);
+    }
+
+    // Initialize Wifi
+    nvs_flash_init();
+    wifi_connection(wifi_ssid, wifi_pass);
 
     // Configure all GPIO pins
     configure_pins();
