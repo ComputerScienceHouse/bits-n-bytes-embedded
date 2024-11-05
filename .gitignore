@@ -5,6 +5,9 @@
 # MacOS
 .DS_Store
 
+# Secrets
+doors/main/secrets.h
+
 # Build
 doors/build/*
 doors/cmake-build-debug
