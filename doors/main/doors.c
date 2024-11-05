@@ -10,21 +10,23 @@
 #include <string.h>
 #include "esp_system.h"
 #include "esp_wifi.h"
-#include "freertos/event_groups.h"
+#include "secrets.h"
 
 // Pin definitions
-#define LEFT_DOOR_CONTROL_PIN 12
-#define LEFT_DOOR_SENSOR_PIN 13
-#define RIGHT_DOOR_CONTROL_PIN 14
-#define RIGHT_DOOR_SENSOR_PIN 15
+#define DOOR_CONTROL_PIN 5
+#define LEFT_DOOR_SENSOR_PIN 11
+#define RIGHT_DOOR_SENSOR_PIN 9
+#define HATCH_CONTROL_PIN 7
+
+#define LED_PIN 15
 
 // MQTT definitions
-#define MQTT_BROKER_URI ""
+#define MQTT_BROKER_URI "mqtt://test.mosquitto.org:1883"
 #define DOOR_CONTROL_TOPIC "aux/control/doors"
 #define DOOR_STATUS_TOPIC "aux/status/doors"
 
 #define PUBLISH_STATUS_DELAY_MS 1000
-#define DOOR_TRIGGER_DELAY_MS 1000
+#define DOOR_TRIGGER_DELAY_MS 100
 
 esp_mqtt_client_handle_t mqtt_client = NULL;
 
@@ -36,12 +38,12 @@ void configure_pins() {
     gpio_config_t door_control_conf = {
             .intr_type = GPIO_INTR_DISABLE,
             .mode = GPIO_MODE_OUTPUT,
-            .pin_bit_mask = (1ULL << LEFT_DOOR_CONTROL_PIN) |
-                    (1ULL << RIGHT_DOOR_CONTROL_PIN),
+            .pin_bit_mask = 1ULL << DOOR_CONTROL_PIN,
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .pull_up_en = GPIO_PULLUP_DISABLE,
     };
     gpio_config(&door_control_conf);
+    gpio_set_level(DOOR_CONTROL_PIN, 1);
     // Configure the door sensor pins for the left and right doors
     gpio_config_t door_sensor_conf = {
             .intr_type = GPIO_INTR_DISABLE,
@@ -52,6 +54,15 @@ void configure_pins() {
             .pull_up_en = GPIO_PULLUP_ENABLE
     };
     gpio_config(&door_sensor_conf);
+    // Set LED
+    gpio_config_t led_pin = {
+            .intr_type = GPIO_INTR_DISABLE,
+            .mode = GPIO_MODE_OUTPUT,
+            .pin_bit_mask = 1ULL << LED_PIN,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .pull_up_en = GPIO_PULLUP_DISABLE
+    };
+    gpio_config(&led_pin);
 }
 
 
@@ -59,11 +70,12 @@ void configure_pins() {
  * Open the doors
  */
 void open_doors() {
-    gpio_set_level(LEFT_DOOR_CONTROL_PIN, 1);
-    gpio_set_level(RIGHT_DOOR_CONTROL_PIN, 1);
+    gpio_set_level(LED_PIN, 0);
+    gpio_set_level(DOOR_CONTROL_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(DOOR_TRIGGER_DELAY_MS));
-    gpio_set_level(LEFT_DOOR_CONTROL_PIN, 0);
-    gpio_set_level(RIGHT_DOOR_CONTROL_PIN, 0);
+    gpio_set_level(DOOR_CONTROL_PIN, 1);
+    gpio_set_level(LED_PIN, 1);
+
 }
 
 
@@ -72,7 +84,7 @@ void open_doors() {
  * @return boolean
  */
 bool is_left_door_closed() {
-    return gpio_get_level(LEFT_DOOR_SENSOR_PIN);
+    return !gpio_get_level(LEFT_DOOR_SENSOR_PIN);
 }
 
 
@@ -81,7 +93,7 @@ bool is_left_door_closed() {
  * @return boolean
  */
 bool is_right_door_closed() {
-    return gpio_get_level(RIGHT_DOOR_SENSOR_PIN);
+    return !gpio_get_level(RIGHT_DOOR_SENSOR_PIN);
 }
 
 
@@ -185,13 +197,18 @@ static void wifi_event_handler(void * event_handler_arg, esp_event_base_t event_
     } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
         printf("Wifi connected\n");
         retry_num = 0;
+        gpio_set_level(LED_PIN, 1);
     } else if(event_id == WIFI_EVENT_STA_DISCONNECTED) {
         printf("Wifi lost connection\n");
-        if(retry_num < 5) {
-            esp_wifi_connect();
-            retry_num++;
-            printf("Trying to reconnect... (%d)\n", retry_num);
+        esp_wifi_connect();
+        printf("Trying to reconnect... (%d)\n", retry_num);
+        // Flash LED based on the retry number
+        if(retry_num % 2 == 0) {
+            gpio_set_level(LED_PIN, 0);
+        } else {
+            gpio_set_level(LED_PIN, 1);
         }
+        retry_num++;
     } else if (event_id == IP_EVENT_STA_GOT_IP) {
         printf("Wifi got IP\n");
     }
@@ -228,17 +245,8 @@ void app_main(void)
 {
 
     // Get Wifi SSID and password
-    const char *wifi_ssid = getenv("ESP_WIFI_SSID");
-    if(wifi_ssid == NULL) {
-        printf("Wifi SSID not defined in env!");
-    }
-    const char *wifi_pass = getenv("ESP_WIFI_PASS");
-    if(wifi_pass == NULL) {
-        printf("Wifi password not defined in env!");
-    }
-    if (wifi_ssid == NULL || wifi_pass == NULL) {
-        exit(1);
-    }
+    const char *wifi_ssid = WIFI_SSID;
+    const char *wifi_pass = WIFI_PASS;
 
     // Initialize Wifi
     nvs_flash_init();
