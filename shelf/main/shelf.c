@@ -9,7 +9,7 @@
 #include <hx711.h>
 
 // MQTT definitions
-#define MQTT_BROKER_URI "mqtt://test.mosquitto.org:1883"
+#define MQTT_BROKER_URI "mqtt://bnbui.local"
 #define SHELF_DATA_TOPIC "shelf/data"
 
 #define WEIGHT_POLLING_DELAY_MS 1000
