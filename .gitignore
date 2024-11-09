@@ -7,11 +7,15 @@
 
 # Secrets
 doors/main/secrets.h
+shelf/main/secrets.h
 
 # Build
 doors/build/*
 doors/cmake-build-debug
 doors/sdkconfig*
+shelf/build/*
+shelf/cmake-build-debug
+shelf/sdkconfig*
 
 # Prerequisites
 *.d
