@@ -6,7 +6,7 @@
 #include <esp_netif.h>
 #include <esp_wifi_default.h>
 #include <esp_wifi.h>
-#include <hx711.h>
+#include "hx711.h"
 
 // MQTT definitions
 #define MQTT_BROKER_URI "mqtt://bnbui.local"
@@ -14,50 +14,27 @@
 
 #define WEIGHT_POLLING_DELAY_MS 1000
 #define LOAD_CELL_WAIT_TIMEOUT_MS 125
-#define LOAD_CELL_SCALING_FACTOR 0.01
+#define LOAD_CELL_SCALING_FACTOR 1
 
 // Pin definitions
 #define LED_PIN 15
-hx711_t slot_0_upper = {
-        .dout = GPIO_NUM_5,
-        .pd_sck = GPIO_NUM_2,
-        .gain = HX711_GAIN_A_128
-};
-hx711_t slot_0_lower = {
-        .dout = GPIO_NUM_7,
-        .pd_sck = GPIO_NUM_2,
-        .gain = HX711_GAIN_A_128
-};
-hx711_t slot_1_upper = {
-        .dout = GPIO_NUM_11,
-        .pd_sck = GPIO_NUM_2,
-        .gain = HX711_GAIN_A_128
-};
-hx711_t slot_1_lower = {
-        .dout = GPIO_NUM_9,
-        .pd_sck = GPIO_NUM_2,
-        .gain = HX711_GAIN_A_128
-};
-hx711_t slot_2_upper = {
-        .dout = GPIO_NUM_33,
-        .pd_sck = GPIO_NUM_2,
-        .gain = HX711_GAIN_A_128
-};
-hx711_t slot_2_lower = {
-        .dout = GPIO_NUM_18,
-        .pd_sck = GPIO_NUM_2,
-        .gain = HX711_GAIN_A_128
-};
-hx711_t slot_3_upper = {
-        .dout = GPIO_NUM_35,
-        .pd_sck = GPIO_NUM_2,
-        .gain = HX711_GAIN_A_128
-};
-hx711_t slot_3_lower = {
-        .dout = GPIO_NUM_37,
-        .pd_sck = GPIO_NUM_2,
-        .gain = HX711_GAIN_A_128
-};
+#define LC_CLOCK_PIN 2
+#define SLOT_0_UPPER_PIN 5
+#define SLOT_0_LOWER_PIN 7
+#define SLOT_1_UPPER_PIN 11
+#define SLOT_1_LOWER_PIN 9
+#define SLOT_2_UPPER_PIN 33
+#define SLOT_2_LOWER_PIN 18
+#define SLOT_3_UPPER_PIN 35
+#define SLOT_3_LOWER_PIN 37
+hx711_t slot_0_upper;
+hx711_t slot_0_lower;
+hx711_t slot_1_upper;
+hx711_t slot_1_lower;
+hx711_t slot_2_upper;
+hx711_t slot_2_lower;
+hx711_t slot_3_upper;
+hx711_t slot_3_lower;
 
 esp_mqtt_client_handle_t mqtt_client = NULL;
 
@@ -75,6 +52,25 @@ void configure_pins() {
             .pull_up_en = GPIO_PULLUP_DISABLE
     };
     gpio_config(&led_pin);
+
+}
+
+/**
+ * Read data from a load cell. Note that if the data is unable to be read, the
+ * data will not be modified so the last set value will be used.
+ * @param load_cell_t
+ * @param output
+ */
+void read_load_cell_data(hx711_t* load_cell_t, int32_t* output) {
+    esp_err_t r = hx711_wait(load_cell_t, LOAD_CELL_WAIT_TIMEOUT_MS);
+    if (r != ESP_OK) {
+        printf("Load cell was not ready\n");
+        return;
+    }
+    r = hx711_read_data(load_cell_t, output);
+    if (r != ESP_OK) {
+        printf("Unable to read load cell data\n");
+    }
 }
 
 
@@ -84,25 +80,15 @@ void configure_pins() {
 void publish_scale_values() {
     int32_t raw_values[8]; // Array for storing all values
     // Get shelf 0
-    ESP_ERROR_CHECK(hx711_wait(&slot_0_upper, LOAD_CELL_WAIT_TIMEOUT_MS));
-    ESP_ERROR_CHECK(hx711_read_data(&slot_0_upper, &raw_values[0]));
-    ESP_ERROR_CHECK(hx711_wait(&slot_0_lower, LOAD_CELL_WAIT_TIMEOUT_MS));
-    ESP_ERROR_CHECK(hx711_read_data(&slot_0_lower, &raw_values[1]));
-    // Get shelf 1
-    ESP_ERROR_CHECK(hx711_wait(&slot_1_upper, LOAD_CELL_WAIT_TIMEOUT_MS));
-    ESP_ERROR_CHECK(hx711_read_data(&slot_1_upper, &raw_values[2]));
-    ESP_ERROR_CHECK(hx711_wait(&slot_1_lower, LOAD_CELL_WAIT_TIMEOUT_MS));
-    ESP_ERROR_CHECK(hx711_read_data(&slot_1_lower, &raw_values[3]));
-    // Get shelf 2
-    ESP_ERROR_CHECK(hx711_wait(&slot_2_upper, LOAD_CELL_WAIT_TIMEOUT_MS));
-    ESP_ERROR_CHECK(hx711_read_data(&slot_2_upper, &raw_values[4]));
-    ESP_ERROR_CHECK(hx711_wait(&slot_2_lower, LOAD_CELL_WAIT_TIMEOUT_MS));
-    ESP_ERROR_CHECK(hx711_read_data(&slot_2_lower, &raw_values[5]));
-    // Get shelf 3
-    ESP_ERROR_CHECK(hx711_wait(&slot_3_upper, LOAD_CELL_WAIT_TIMEOUT_MS));
-    ESP_ERROR_CHECK(hx711_read_data(&slot_3_upper, &raw_values[6]));
-    ESP_ERROR_CHECK(hx711_wait(&slot_3_lower, LOAD_CELL_WAIT_TIMEOUT_MS));
-    ESP_ERROR_CHECK(hx711_read_data(&slot_3_lower, &raw_values[7]));
+    read_load_cell_data(&slot_0_upper, &raw_values[0]);
+    read_load_cell_data(&slot_0_lower, &raw_values[1]);
+    read_load_cell_data(&slot_1_upper, &raw_values[2]);
+    read_load_cell_data(&slot_1_lower, &raw_values[3]);
+    read_load_cell_data(&slot_2_upper, &raw_values[4]);
+    read_load_cell_data(&slot_2_lower, &raw_values[5]);
+    read_load_cell_data(&slot_3_upper, &raw_values[6]);
+    read_load_cell_data(&slot_3_lower, &raw_values[7]);
+
 
     // Calculate the sum of the values for each scale, and multiply by the
     // scaling factor.
@@ -136,12 +122,52 @@ void publish_scale_values() {
  * @param pvParameters
  */
 _Noreturn void publish_scale_values_task(void *pvParameters) {
+
+    // Initialize all load cell
+    slot_0_upper.dout = SLOT_0_UPPER_PIN;
+    slot_0_upper.pd_sck = LC_CLOCK_PIN;
+    slot_0_upper.gain = HX711_GAIN_A_64;
+    ESP_ERROR_CHECK(hx711_init(&slot_0_upper));
+
+    slot_0_lower.dout = SLOT_0_LOWER_PIN;
+    slot_0_lower.pd_sck = LC_CLOCK_PIN;
+    slot_0_lower.gain = HX711_GAIN_A_64;
+    ESP_ERROR_CHECK(hx711_init(&slot_0_lower));
+
+    slot_1_upper.dout = SLOT_1_UPPER_PIN,
+    slot_1_upper.pd_sck = LC_CLOCK_PIN;
+    slot_1_upper.gain = HX711_GAIN_A_64;
+    ESP_ERROR_CHECK(hx711_init(&slot_1_upper));
+
+    slot_1_lower.dout = SLOT_1_LOWER_PIN;
+    slot_1_lower.pd_sck = LC_CLOCK_PIN;
+    slot_1_lower.gain = HX711_GAIN_A_64;
+    ESP_ERROR_CHECK(hx711_init(&slot_1_lower));
+
+    slot_2_upper.dout = SLOT_2_UPPER_PIN;
+    slot_2_upper.pd_sck = LC_CLOCK_PIN;
+    slot_2_upper.gain = HX711_GAIN_A_64;
+    ESP_ERROR_CHECK(hx711_init(&slot_2_upper));
+
+    slot_2_lower.dout = SLOT_2_LOWER_PIN,
+    slot_2_lower.pd_sck = LC_CLOCK_PIN;
+    slot_2_lower.gain = HX711_GAIN_A_64;
+    ESP_ERROR_CHECK(hx711_init(&slot_2_lower));
+
+    slot_3_upper.dout = SLOT_3_UPPER_PIN;
+    slot_3_upper.pd_sck = LC_CLOCK_PIN;
+    slot_3_upper.gain = HX711_GAIN_A_64;
+    ESP_ERROR_CHECK(hx711_init(&slot_3_upper));
+
+    slot_3_lower.dout = SLOT_3_LOWER_PIN;
+    slot_3_lower.pd_sck = LC_CLOCK_PIN;
+    slot_3_lower.gain = HX711_GAIN_A_64;
+    ESP_ERROR_CHECK(hx711_init(&slot_3_lower));
+
+    // Continuously read the values
     while(1) {
-        //publish_scale_values();
-        gpio_set_level(LED_PIN, 1);
+        publish_scale_values();
         vTaskDelay(pdMS_TO_TICKS(WEIGHT_POLLING_DELAY_MS));
-        gpio_set_level(LED_PIN, 0);
-        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -224,6 +250,7 @@ void mqtt_app_start() {
 
     // Register callback for events
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler_wrapper, NULL);
+    ESP_ERROR_CHECK(esp_mqtt_client_start(mqtt_client));
 }
 
 /**
@@ -257,6 +284,9 @@ void wifi_connection(const char* wifi_ssid, const char* wifi_pass) {
  */
 void app_main(void)
 {
+
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
     // Get Wifi SSID and password
     const char *wifi_ssid = WIFI_SSID;
     const char *wifi_pass = WIFI_PASS;
@@ -268,8 +298,9 @@ void app_main(void)
     // Configure all GPIO pins
     configure_pins();
 
+
     // Start the MQTT app
-    //mqtt_app_start();
+    mqtt_app_start();
 
     // Create the shelf data publishing task
     xTaskCreate(&publish_scale_values_task, "publish_scale_values_task", 2048, NULL, 5, NULL);
