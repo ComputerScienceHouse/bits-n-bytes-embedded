@@ -19,16 +19,20 @@
 #define RIGHT_DOOR_UPPER_SENSOR_PIN 9
 #define RIGHT_DOOR_LOWER_SENSOR_PIN 2
 #define HATCH_CONTROL_PIN 7
+#define HATCH_LEFT_SENSOR_PIN 3
+#define HATCH_RIGHT_SENSOR_PIN 4
 
 #define LED_PIN 15
 
 // MQTT definitions
 #define MQTT_BROKER_URI "mqtt://bnbui.local"
 #define DOOR_CONTROL_TOPIC "aux/control/doors"
+#define HATCH_CONTROL_TOPIC "aux/control/hatch"
 #define DOOR_STATUS_TOPIC "aux/status/doors"
+#define HATCH_STATUS_TOPIC "aux/status/hatch"
 
-#define PUBLISH_STATUS_DELAY_MS 1000
 #define DOOR_TRIGGER_DELAY_MS 100
+#define HATCH_TRIGGER_DELAY_MS 100
 
 esp_mqtt_client_handle_t mqtt_client = NULL;
 
@@ -37,34 +41,40 @@ esp_mqtt_client_handle_t mqtt_client = NULL;
  */
 void configure_pins() {
     // Configure the door control pins for the left and right doors
-    gpio_config_t door_control_conf = {
+    gpio_config_t control_pin_conf = {
             .intr_type = GPIO_INTR_DISABLE,
             .mode = GPIO_MODE_OUTPUT,
-            .pin_bit_mask = 1ULL << DOOR_CONTROL_PIN,
+            .pin_bit_mask = (1ULL << DOOR_CONTROL_PIN) |
+                            (1ULL << HATCH_CONTROL_PIN),
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .pull_up_en = GPIO_PULLUP_DISABLE,
     };
-    gpio_config(&door_control_conf);
+    gpio_config(&control_pin_conf);
     gpio_set_level(DOOR_CONTROL_PIN, 1);
+    gpio_set_level(HATCH_CONTROL_PIN, 1);
     // Configure the door sensor pins for the left and right doors
-    gpio_config_t door_sensor_conf = {
+    gpio_config_t sensor_pin_conf = {
             .intr_type = GPIO_INTR_DISABLE,
             .mode = GPIO_MODE_INPUT,
             .pin_bit_mask = (1ULL << LEFT_DOOR_UPPER_SENSOR_PIN) |
-                            (1ULL << RIGHT_DOOR_UPPER_SENSOR_PIN),
+                            (1ULL << LEFT_DOOR_LOWER_SENSOR_PIN) |
+                            (1ULL << RIGHT_DOOR_UPPER_SENSOR_PIN) |
+                            (1ULL << RIGHT_DOOR_LOWER_SENSOR_PIN) |
+                            (1ULL << HATCH_LEFT_SENSOR_PIN) |
+                            (1ULL << HATCH_RIGHT_SENSOR_PIN),
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .pull_up_en = GPIO_PULLUP_ENABLE
     };
-    gpio_config(&door_sensor_conf);
+    gpio_config(&sensor_pin_conf);
     // Set LED
-    gpio_config_t led_pin = {
+    gpio_config_t led_pin_conf = {
             .intr_type = GPIO_INTR_DISABLE,
             .mode = GPIO_MODE_OUTPUT,
             .pin_bit_mask = 1ULL << LED_PIN,
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .pull_up_en = GPIO_PULLUP_DISABLE
     };
-    gpio_config(&led_pin);
+    gpio_config(&led_pin_conf);
 }
 
 
@@ -77,7 +87,18 @@ void open_doors() {
     vTaskDelay(pdMS_TO_TICKS(DOOR_TRIGGER_DELAY_MS));
     gpio_set_level(DOOR_CONTROL_PIN, 1);
     gpio_set_level(LED_PIN, 1);
+}
 
+
+/**
+ * Open the hatch
+ */
+void open_hatch() {
+    gpio_set_level(LED_PIN, 0);
+    gpio_set_level(HATCH_CONTROL_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(HATCH_TRIGGER_DELAY_MS));
+    gpio_set_level(HATCH_CONTROL_PIN, 1);
+    gpio_set_level(LED_PIN, 1);
 }
 
 
@@ -86,7 +107,7 @@ void open_doors() {
  * @return boolean
  */
 bool is_left_door_closed() {
-    return !gpio_get_level(LEFT_DOOR_UPPER_SENSOR_PIN);
+    return !gpio_get_level(LEFT_DOOR_UPPER_SENSOR_PIN) && !gpio_get_level(LEFT_DOOR_LOWER_SENSOR_PIN);
 }
 
 
@@ -95,12 +116,12 @@ bool is_left_door_closed() {
  * @return boolean
  */
 bool is_right_door_closed() {
-    return !gpio_get_level(RIGHT_DOOR_UPPER_SENSOR_PIN);
+    return !gpio_get_level(RIGHT_DOOR_UPPER_SENSOR_PIN) && !gpio_get_level(RIGHT_DOOR_LOWER_SENSOR_PIN);
 }
 
 
 /**
- * Check if both doors are closeds
+ * Check if both doors are closed
  *
  * @return boolean
  */
@@ -110,17 +131,52 @@ bool are_doors_closed() {
 
 
 /**
- * Publish the door status
+ * Check if the left hatch is closed
+ * @return
  */
-void publish_door_status() {
+bool is_left_hatch_closed() {
+    return !gpio_get_level(HATCH_LEFT_SENSOR_PIN);
+}
+
+
+/**
+ * Check if the right hatch is closed
+ * @return
+ */
+bool is_right_hatch_closed() {
+    return !gpio_get_level(HATCH_RIGHT_SENSOR_PIN);
+}
+
+
+/**
+ * Check if the hatch is closed
+ * @return
+ */
+bool is_hatch_closed() {
+    return is_left_hatch_closed() && is_right_hatch_closed();
+}
+
+
+/**
+ * Publish that the doors are closed
+ */
+void publish_doors_closed() {
     char status_msg[7];
-    if (are_doors_closed()) {
-        sprintf(status_msg, "closed");
-    } else {
-        sprintf(status_msg, "open");
-    }
+    sprintf(status_msg, "closed");
     if (mqtt_client) {
         esp_mqtt_client_publish(mqtt_client, DOOR_STATUS_TOPIC, status_msg, 0, 1, 0);
+    }
+}
+
+
+/**
+ * Publish that the hatches are closed
+ */
+void publish_hatch_closed() {
+    char status_msg[7];
+    sprintf(status_msg, "closed");
+    if (mqtt_client) {
+        esp_mqtt_client_publish(mqtt_client, HATCH_STATUS_TOPIC, status_msg, 0, 1, 0);
     }
 }
 
@@ -130,9 +186,31 @@ void publish_door_status() {
  * @param pvParameters
  */
 _Noreturn void publish_door_status_task(void *pvParameters) {
+    bool doors_previously_closed = false; // Store previous state
+    bool hatch_previously_closed = false; // Store the previous state
     while (1) {
-        publish_door_status();
-        vTaskDelay(pdMS_TO_TICKS(PUBLISH_STATUS_DELAY_MS));
+        // Check doors status
+        if (are_doors_closed()) {
+            if (!doors_previously_closed) {
+                // Publish message if doors are now closed and were not closed
+                // previously
+                doors_previously_closed = true;
+                publish_doors_closed();
+            }
+        } else {
+            doors_previously_closed = false;
+        }
+        // Check hatch status
+        if (is_hatch_closed()) {
+            if (!hatch_previously_closed) {
+                // Publish message of hatch is now closed and was not closed
+                // previously
+                hatch_previously_closed = true;
+                publish_hatch_closed();
+            }
+        } else {
+            hatch_previously_closed = false;
+        }
     }
 }
 
@@ -154,6 +232,10 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event) {
             if (strncmp(event->topic, DOOR_CONTROL_TOPIC, event->topic_len) == 0) {
                 if (strncmp(event->data, "open", event->data_len) == 0) {
                     open_doors();
+                }
+            } else if (strncmp(event->topic, HATCH_CONTROL_TOPIC, event->topic_len) == 0) {
+                if (strncmp(event->data, "open", event->data_len) == 0) {
+                    open_hatch();
                 }
             }
             break;
