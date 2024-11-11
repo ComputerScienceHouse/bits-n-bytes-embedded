@@ -7,6 +7,7 @@
 #include <esp_wifi_default.h>
 #include <esp_wifi.h>
 #include "hx711.h"
+#include <esp_mac.h>
 
 // MQTT definitions
 #define MQTT_BROKER_URI "mqtt://bnbui.local"
@@ -38,6 +39,7 @@ hx711_t slot_3_lower;
 
 esp_mqtt_client_handle_t mqtt_client = NULL;
 
+static char mac_address_str[18];
 
 /**
  * Configure pins
@@ -103,9 +105,10 @@ void publish_scale_values() {
     sprintf(
             payload_buffer,
             "{\n"
-            "\tid:\n"
-            "\tdata:[%lf, %lf, %lf, %lf]\n"
+            "\tid: \"%s\"\n"
+            "\tdata: [%lf, %lf, %lf, %lf]\n"
             "}\n",
+            mac_address_str,
             slot_values[0],
             slot_values[1],
             slot_values[2],
@@ -280,6 +283,17 @@ void wifi_connection(const char* wifi_ssid, const char* wifi_pass) {
 
 
 /**
+ * Store MAC address
+ */
+void store_mac_address() {
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(mac_address_str, sizeof(mac_address_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+
+/**
  * Main function, runs once on app start.
  */
 void app_main(void)
@@ -295,9 +309,11 @@ void app_main(void)
     nvs_flash_init();
     wifi_connection(wifi_ssid, wifi_pass);
 
+    // Store the mac address to send in MQTT messages
+    store_mac_address();
+
     // Configure all GPIO pins
     configure_pins();
-
 
     // Start the MQTT app
     mqtt_app_start();
