@@ -228,6 +228,7 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event) {
         case MQTT_EVENT_CONNECTED:
             // On connection, subscribe to the door control topic
             esp_mqtt_client_subscribe(client, DOOR_CONTROL_TOPIC, 0);
+            esp_mqtt_client_subscribe(client, HATCH_CONTROL_TOPIC, 0);
             break;
         case MQTT_EVENT_DATA:
             if (strncmp(event->topic, DOOR_CONTROL_TOPIC, event->topic_len) == 0) {
