@@ -40,6 +40,8 @@ esp_mqtt_client_handle_t mqtt_client = NULL;
  * Configure the pins for the doors
  */
 void configure_pins() {
+    gpio_set_level(DOOR_CONTROL_PIN, 1);
+    gpio_set_level(HATCH_CONTROL_PIN, 1);
     // Configure the door control pins for the left and right doors
     gpio_config_t control_pin_conf = {
             .intr_type = GPIO_INTR_DISABLE,
@@ -50,8 +52,7 @@ void configure_pins() {
             .pull_up_en = GPIO_PULLUP_DISABLE,
     };
     gpio_config(&control_pin_conf);
-    gpio_set_level(DOOR_CONTROL_PIN, 1);
-    gpio_set_level(HATCH_CONTROL_PIN, 1);
+
     // Configure the door sensor pins for the left and right doors
     gpio_config_t sensor_pin_conf = {
             .intr_type = GPIO_INTR_DISABLE,
@@ -327,6 +328,8 @@ void wifi_connection(const char* wifi_ssid, const char* wifi_pass) {
  */
 void app_main(void)
 {
+    // Configure all GPIO pins
+    configure_pins();
 
     // Get Wifi SSID and password
     const char *wifi_ssid = WIFI_SSID;
@@ -335,9 +338,6 @@ void app_main(void)
     // Initialize Wifi
     nvs_flash_init();
     wifi_connection(wifi_ssid, wifi_pass);
-
-    // Configure all GPIO pins
-    configure_pins();
 
     // Start the MQTT app
     mqtt_app_start();
