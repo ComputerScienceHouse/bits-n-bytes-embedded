@@ -20,14 +20,16 @@
 // Pin definitions
 #define LED_PIN 15
 #define LC_CLOCK_PIN 2
-#define SLOT_0_UPPER_PIN 5
-#define SLOT_0_LOWER_PIN 7
-#define SLOT_1_UPPER_PIN 11
-#define SLOT_1_LOWER_PIN 9
-#define SLOT_2_UPPER_PIN 33
-#define SLOT_2_LOWER_PIN 18
-#define SLOT_3_UPPER_PIN 35
-#define SLOT_3_LOWER_PIN 37
+
+// SHELF 2 PINS
+#define SLOT_0_UPPER_PIN 37
+#define SLOT_0_LOWER_PIN 35
+#define SLOT_1_UPPER_PIN 18
+#define SLOT_1_LOWER_PIN 33
+#define SLOT_2_UPPER_PIN 11
+#define SLOT_2_LOWER_PIN 9
+#define SLOT_3_UPPER_PIN 7
+#define SLOT_3_LOWER_PIN 5
 hx711_t slot_0_upper;
 hx711_t slot_0_lower;
 hx711_t slot_1_upper;
@@ -105,8 +107,8 @@ void publish_scale_values() {
     sprintf(
             payload_buffer,
             "{\n"
-            "\tid: \"%s\"\n"
-            "\tdata: [%lf, %lf, %lf, %lf]\n"
+            "\t\"id\": \"%s\",\n"
+            "\t\"data\": [%lf, %lf, %lf, %lf]\n"
             "}\n",
             mac_address_str,
             slot_values[0],
