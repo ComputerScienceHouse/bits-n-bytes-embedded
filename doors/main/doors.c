@@ -11,6 +11,7 @@
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "secrets.h"
+#include "esp_timer.h"
 
 // Pin definitions
 #define DOOR_CONTROL_PIN 5
@@ -33,8 +34,10 @@
 
 #define DOOR_TRIGGER_DELAY_MS 100
 #define HATCH_TRIGGER_DELAY_MS 100
+#define CLOSED_MESSAGE_COOL_DOWN_MICRO_S 3000000
 
 esp_mqtt_client_handle_t mqtt_client = NULL;
+int64_t doors_closed_msg_last_send_micro_s = 0;
 
 /**
  * Configure the pins for the doors
@@ -83,6 +86,8 @@ void configure_pins() {
  * Open the doors
  */
 void open_doors() {
+    // Set the open doors last send to prevent this from triggering the doors open
+    doors_closed_msg_last_send_micro_s = esp_timer_get_time();
     gpio_set_level(LED_PIN, 0);
     gpio_set_level(DOOR_CONTROL_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(DOOR_TRIGGER_DELAY_MS));
@@ -165,7 +170,11 @@ void publish_doors_closed() {
     char status_msg[7];
     sprintf(status_msg, "closed");
     if (mqtt_client) {
-        esp_mqtt_client_publish(mqtt_client, DOOR_STATUS_TOPIC, status_msg, 0, 1, 0);
+        // Check message cooldown time
+        if (esp_timer_get_time() >= doors_closed_msg_last_send_micro_s + CLOSED_MESSAGE_COOL_DOWN_MICRO_S) {
+            esp_mqtt_client_publish(mqtt_client, DOOR_STATUS_TOPIC, status_msg, 0, 1, 0);
+            doors_closed_msg_last_send_micro_s = esp_timer_get_time();
+        }
     }
 }
 
