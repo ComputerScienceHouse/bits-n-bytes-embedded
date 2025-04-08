@@ -1,0 +1,9 @@
+[submodule "components/esp_ws28xx"]
+	path = components/esp_ws28xx
+	url = git@github.com:okhsunrog/esp_ws28xx.git
+[submodule "doors/esp_ws28xx"]
+	path = doors/esp_ws28xx
+	url = git@github.com:okhsunrog/esp_ws28xx.git
+[submodule "doors/components/esp_ws28xx"]
+	path = doors/components/esp_ws28xx
+	url = git@github.com:okhsunrog/esp_ws28xx.git
