@@ -209,6 +209,7 @@ _Noreturn void publish_door_status_task(void *pvParameters) {
             }
         } else {
             doors_previously_closed = false;
+            // TODO publish doors open message as soon as they are opened
         }
         // Check hatch status
         if (is_hatch_closed()) {
