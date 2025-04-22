@@ -8,11 +8,9 @@
 #include "esp_log.h"
 #include "esp_event.h"
 #include <string.h>
-#include "esp_system.h"
 #include "esp_wifi.h"
 #include "secrets.h"
 #include "esp_timer.h"
-#include "esp_ws28xx.h"
 
 // Pin definitions
 #define DOOR_CONTROL_PIN 5
@@ -24,8 +22,8 @@
 #define HATCH_LEFT_SENSOR_PIN 3
 #define HATCH_RIGHT_SENSOR_PIN 4
 
-#define LED_PIN 37
-#define LED_NUM 10
+#define BUILT_IN_LED_PIN 15
+#define CABINET_LED_CONTROL_PIN 18
 
 // MQTT definitions
 #define MQTT_BROKER_URI "mqtt://bnbui.local"
@@ -42,8 +40,6 @@ esp_mqtt_client_handle_t mqtt_client = NULL;
 int64_t doors_closed_msg_last_send_micro_s = 0;
 
 static const char *TAG = "doors";
-static uint8_t led_state_off = 0;
-CRGB* ws2812_buffer;
 
 /**
  * Configure the pins for the doors
@@ -80,7 +76,8 @@ void configure_pins() {
     gpio_config_t led_pin_conf = {
             .intr_type = GPIO_INTR_DISABLE,
             .mode = GPIO_MODE_OUTPUT,
-            .pin_bit_mask = 1ULL << LED_PIN,
+            .pin_bit_mask = (1ULL << BUILT_IN_LED_PIN) |
+                            (1ULL << CABINET_LED_CONTROL_PIN),
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .pull_up_en = GPIO_PULLUP_DISABLE
     };
@@ -94,11 +91,11 @@ void configure_pins() {
 void open_doors() {
     // Set the open doors last send to prevent this from triggering the doors open
     doors_closed_msg_last_send_micro_s = esp_timer_get_time();
-    gpio_set_level(LED_PIN, 0);
+    gpio_set_level(BUILT_IN_LED_PIN, 0);
     gpio_set_level(DOOR_CONTROL_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(DOOR_TRIGGER_DELAY_MS));
     gpio_set_level(DOOR_CONTROL_PIN, 1);
-    gpio_set_level(LED_PIN, 1);
+    gpio_set_level(BUILT_IN_LED_PIN, 1);
 }
 
 
@@ -106,11 +103,11 @@ void open_doors() {
  * Open the hatch
  */
 void open_hatch() {
-    gpio_set_level(LED_PIN, 0);
+    gpio_set_level(BUILT_IN_LED_PIN, 0);
     gpio_set_level(HATCH_CONTROL_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(HATCH_TRIGGER_DELAY_MS));
     gpio_set_level(HATCH_CONTROL_PIN, 1);
-    gpio_set_level(LED_PIN, 1);
+    gpio_set_level(BUILT_IN_LED_PIN, 1);
 }
 
 
@@ -213,8 +210,10 @@ _Noreturn void publish_door_status_task(void *pvParameters) {
                 doors_previously_closed = true;
                 publish_doors_closed();
             }
+            gpio_set_level(CABINET_LED_CONTROL_PIN, 0);
         } else {
             doors_previously_closed = false;
+            gpio_set_level(CABINET_LED_CONTROL_PIN, 1);
         }
         // Check hatch status
         if (is_hatch_closed()) {
@@ -298,16 +297,16 @@ static void wifi_event_handler(void * event_handler_arg, esp_event_base_t event_
     } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
         printf("Wifi connected\n");
         retry_num = 0;
-        gpio_set_level(LED_PIN, 1);
+        gpio_set_level(BUILT_IN_LED_PIN, 1);
     } else if(event_id == WIFI_EVENT_STA_DISCONNECTED) {
         printf("Wifi lost connection\n");
         esp_wifi_connect();
         printf("Trying to reconnect... (%d)\n", retry_num);
         // Flash LED based on the retry number
         if(retry_num % 2 == 0) {
-            gpio_set_level(LED_PIN, 0);
+            gpio_set_level(BUILT_IN_LED_PIN, 0);
         } else {
-            gpio_set_level(LED_PIN, 1);
+            gpio_set_level(BUILT_IN_LED_PIN, 1);
         }
         retry_num++;
     } else if (event_id == IP_EVENT_STA_GOT_IP) {
@@ -339,25 +338,6 @@ void wifi_connection(const char* wifi_ssid, const char* wifi_pass) {
     esp_wifi_connect();
 }
 
-/**
- * Blink the LED
- */
-void blink_led(void) {
-    for(int i = 0; i < LED_NUM; i++) {
-        if (led_state_off) ws2812_buffer[i] = (CRGB){.r=0, .g=0, .b=0};
-        else ws2812_buffer[i] = (CRGB){.r=50, .g=0, .b=0};
-    }
-    ESP_ERROR_CHECK_WITHOUT_ABORT(ws28xx_update());
-}
-_Noreturn void blink_led_task(void *pvParameters) {
-    while (1) {
-        ESP_LOGI(TAG, "Turning the LED strip %s!", led_state_off == true ? "ON" : "OFF");
-        blink_led();
-        led_state_off = !led_state_off;
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-    }
-}
-
 
 /**
  * Main function, runs once on app start.
@@ -374,13 +354,10 @@ void app_main(void)
     // Initialize Wifi
     nvs_flash_init();
     wifi_connection(wifi_ssid, wifi_pass);
-    // Initialize the LED strip
-    ESP_ERROR_CHECK(ws28xx_init(LED_PIN, WS2812B, LED_NUM, &ws2812_buffer));
 
     // Start the MQTT app
     mqtt_app_start();
 
     // Create the door status publishing task
     xTaskCreate(&publish_door_status_task, "publish_door_status_task", 2048, NULL, 5, NULL);
-    xTaskCreate(&blink_led_task, "blink_led_task", 2048, NULL, 5, NULL);
 }
