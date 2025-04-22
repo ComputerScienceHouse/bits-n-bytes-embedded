@@ -1,7 +1,7 @@
 #include <FastLED.h>
 
 #define LED_PIN        6
-#define NUM_LEDS       300
+#define NUM_LEDS       300       // UNO SRAM limit—adjust as needed
 #define LED_TYPE       WS2812B
 #define COLOR_ORDER    GRB
 #define DOOR_PIN       5
@@ -37,7 +37,7 @@ void loop() {
   // 2) Update LEDs based on last read doorState
   if (doorState == HIGH) {
     // Door open → solid warm white
-    fill_solid(leds, NUM_LEDS, CRGB(255, 100, 10));
+    fill_solid(leds, NUM_LEDS, CRGB(255, 100, 30));
     FastLED.show();
   } else {
     // Door closed → smooth rainbow
