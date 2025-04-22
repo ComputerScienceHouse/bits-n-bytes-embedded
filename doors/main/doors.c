@@ -12,6 +12,7 @@
 #include "esp_wifi.h"
 #include "secrets.h"
 #include "esp_timer.h"
+#include "esp_ws28xx.h"
 
 // Pin definitions
 #define DOOR_CONTROL_PIN 5
@@ -23,7 +24,8 @@
 #define HATCH_LEFT_SENSOR_PIN 3
 #define HATCH_RIGHT_SENSOR_PIN 4
 
-#define LED_PIN 15
+#define LED_PIN 37
+#define LED_NUM 10
 
 // MQTT definitions
 #define MQTT_BROKER_URI "mqtt://bnbui.local"
@@ -38,6 +40,10 @@
 
 esp_mqtt_client_handle_t mqtt_client = NULL;
 int64_t doors_closed_msg_last_send_micro_s = 0;
+
+static const char *TAG = "doors";
+static uint8_t led_state_off = 0;
+CRGB* ws2812_buffer;
 
 /**
  * Configure the pins for the doors
@@ -309,6 +315,7 @@ static void wifi_event_handler(void * event_handler_arg, esp_event_base_t event_
     }
 }
 
+
 /**
  * Connect to Wifi
  */
@@ -332,6 +339,25 @@ void wifi_connection(const char* wifi_ssid, const char* wifi_pass) {
     esp_wifi_connect();
 }
 
+/**
+ * Blink the LED
+ */
+void blink_led(void) {
+    for(int i = 0; i < LED_NUM; i++) {
+        if (led_state_off) ws2812_buffer[i] = (CRGB){.r=0, .g=0, .b=0};
+        else ws2812_buffer[i] = (CRGB){.r=50, .g=0, .b=0};
+    }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(ws28xx_update());
+}
+_Noreturn void blink_led_task(void *pvParameters) {
+    while (1) {
+        ESP_LOGI(TAG, "Turning the LED strip %s!", led_state_off == true ? "ON" : "OFF");
+        blink_led();
+        led_state_off = !led_state_off;
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+}
+
 
 /**
  * Main function, runs once on app start.
@@ -348,10 +374,13 @@ void app_main(void)
     // Initialize Wifi
     nvs_flash_init();
     wifi_connection(wifi_ssid, wifi_pass);
+    // Initialize the LED strip
+    ESP_ERROR_CHECK(ws28xx_init(LED_PIN, WS2812B, LED_NUM, &ws2812_buffer));
 
     // Start the MQTT app
     mqtt_app_start();
 
     // Create the door status publishing task
     xTaskCreate(&publish_door_status_task, "publish_door_status_task", 2048, NULL, 5, NULL);
+    xTaskCreate(&blink_led_task, "blink_led_task", 2048, NULL, 5, NULL);
 }

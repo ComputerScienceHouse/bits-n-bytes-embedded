@@ -11,7 +11,6 @@ static const char *TAG = "example";
 static uint8_t led_state_off = 0;
 CRGB* ws2812_buffer;
 
-
 void blink_led(void) {
     for(int i = 0; i < LED_NUM; i++) {
         if (led_state_off) ws2812_buffer[i] = (CRGB){.r=0, .g=0, .b=0};
@@ -19,7 +18,6 @@ void blink_led(void) {
     }
     ESP_ERROR_CHECK_WITHOUT_ABORT(ws28xx_update());
 }
-
 
 void app_main(void) {
     ESP_ERROR_CHECK_WITHOUT_ABORT(ws28xx_init(LED_GPIO, WS2812B, LED_NUM, &ws2812_buffer));
