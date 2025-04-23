@@ -13,7 +13,7 @@
 #define MQTT_BROKER_URI "mqtt://bnbui.local"
 #define SHELF_DATA_TOPIC "shelf/data"
 
-#define WEIGHT_POLLING_DELAY_MS 100
+#define WEIGHT_POLLING_DELAY_MS 1000
 #define LOAD_CELL_WAIT_TIMEOUT_MS 125
 #define LOAD_CELL_SCALING_FACTOR 0.01
 
