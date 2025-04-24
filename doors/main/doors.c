@@ -24,6 +24,7 @@
 #define HATCH_RIGHT_SENSOR_PIN 4
 
 #define LED_PIN 15
+#define CABINET_LET_CONTROL_PIN 39
 
 // MQTT definitions
 #define MQTT_BROKER_URI "mqtt://bnbui.local"
@@ -74,7 +75,8 @@ void configure_pins() {
     gpio_config_t led_pin_conf = {
             .intr_type = GPIO_INTR_DISABLE,
             .mode = GPIO_MODE_OUTPUT,
-            .pin_bit_mask = 1ULL << LED_PIN,
+            .pin_bit_mask = (1ULL << LED_PIN) |
+                            (1ULL << CABINET_LET_CONTROL_PIN),
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .pull_up_en = GPIO_PULLUP_DISABLE
     };
@@ -207,8 +209,10 @@ _Noreturn void publish_door_status_task(void *pvParameters) {
                 doors_previously_closed = true;
                 publish_doors_closed();
             }
+            gpio_set_level(CABINET_LET_CONTROL_PIN, 0);
         } else {
             doors_previously_closed = false;
+            gpio_set_level(CABINET_LET_CONTROL_PIN, 1);
         }
         // Check hatch status
         if (is_hatch_closed()) {
