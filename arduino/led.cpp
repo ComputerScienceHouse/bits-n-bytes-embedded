@@ -36,10 +36,12 @@ void loop() {
 
   // 2) Update LEDs based on last read doorState
   if (doorState == HIGH) {
+    FastLED.setBrightness(255);
     // Door open → solid warm white
-    fill_solid(leds, NUM_LEDS, CRGB(255, 100, 30));
+    fill_solid(leds, NUM_LEDS, CRGB(255, 150, 0));
     FastLED.show();
   } else {
+    FastLED.setBrightness(255);
     // Door closed → smooth rainbow
     for (int i = 0; i < NUM_LEDS; i++) {
       leds[i] = CHSV(hue + i / 3, 255, 255);
