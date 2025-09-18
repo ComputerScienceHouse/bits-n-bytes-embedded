@@ -15,10 +15,11 @@
 // TODO send/receive UART packets from raspberry pi
 
 #include <stdio.h>
-#include <driver/gpio.h>
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_now.h"
+#include "driver/uart.h"
 
 // Pins
 #define LED_PIN 2
@@ -30,6 +31,13 @@
 #define HATCH_CONTROL_PIN 7
 #define HATCH_LEFT_SENSOR_PIN 3
 #define HATCH_RIGHT_SENSOR_PIN 4
+#define UART_TX_PIN 1
+#define UART_RX_PIN 2
+
+// UART
+#define UART_PORT_NUM 1
+#define UART_BAUD_RATE 115200
+static const int uart_rx_buffer_size = 1024;
 
 // Timing
 #define DOOR_TRIGGER_DELAY_MS 100 // Leaving latches open for too long is harmful
@@ -179,6 +187,25 @@ void init_wifi () {
 
 
 /**
+ * Initialize UART.
+ */
+void init_uart() {
+    ESP_ERROR_CHECK(uart_driver_install(UART_PORT_NUM, uart_rx_buffer_size, 0, 0, NULL, 0));
+    const uart_port_t uart_num = UART_PORT_NUM;
+    uart_config_t uart_cfg = {
+            .baud_rate = UART_BAUD_RATE,
+            .data_bits = UART_DATA_8_BITS,
+            .parity = UART_PARITY_DISABLE,
+            .stop_bits = UART_STOP_BITS_1,
+            .flow_ctrl = UART_HW_FLOWCTRL_CTS_RTS,
+            .rx_flow_ctrl_thresh = 122
+    };
+    ESP_ERROR_CHECK(uart_param_config(uart_num, &uart_cfg));
+    ESP_ERROR_CHECK(uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+}
+
+
+/**
  * Main app code. Runs once on boot.
  */
 void app_main(void)
@@ -197,6 +224,8 @@ void app_main(void)
     init_wifi();
     ESP_LOGD(TAG, "Initialized wifi radio");
 
+    init_uart();
+    ESP_LOGD(TAG, "Initialized UART");
 
 
 }
