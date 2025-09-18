@@ -17,6 +17,10 @@ shelf/build/*
 shelf/cmake-build-debug
 shelf/sdkconfig*
 
+atlas/build/*
+atlas/cmake-build-debug
+atlas/sdkconfig*
+
 # Prerequisites
 *.d
 
