@@ -8,20 +8,17 @@
 #include <esp_wifi.h>
 #include "hx711.h"
 #include <esp_mac.h>
+#include "esp_log.h"
+#include "esp_now.h"
 
-// MQTT definitions
-#define MQTT_BROKER_URI "mqtt://bnbui.local"
-#define SHELF_DATA_TOPIC "shelf/data"
-
-#define WEIGHT_POLLING_DELAY_MS 1000
-#define LOAD_CELL_WAIT_TIMEOUT_MS 125
+// Timing definition
+#define WEIGHT_UPDATE_DELAY_MS 250
+#define LOAD_CELL_READ_TIMEOUT_MS 125
 #define LOAD_CELL_SCALING_FACTOR 0.01
 
 // Pin definitions
 #define LED_PIN 15
 #define LC_CLOCK_PIN 2
-
-// SHELF 2 PINS
 #define SLOT_0_UPPER_PIN 37
 #define SLOT_0_LOWER_PIN 35
 #define SLOT_1_UPPER_PIN 18
@@ -30,6 +27,8 @@
 #define SLOT_2_LOWER_PIN 9
 #define SLOT_3_UPPER_PIN 7
 #define SLOT_3_LOWER_PIN 5
+
+
 hx711_t slot_0_upper;
 hx711_t slot_0_lower;
 hx711_t slot_1_upper;
@@ -39,12 +38,18 @@ hx711_t slot_2_lower;
 hx711_t slot_3_upper;
 hx711_t slot_3_lower;
 
-esp_mqtt_client_handle_t mqtt_client = NULL;
+// TODO remove atlas mac, this should not be hardcoded
+uint8_t atlas_mac[ESP_NOW_ETH_ALEN] = {0x94, 0xB5, 0x55, 0x8E, 0x2A, 0x21};
+
+
 
 static char mac_address_str[18];
 
+static const char* TAG = "shelf";
+
+
 /**
- * Configure pins
+ * Configure GPIO pins
  */
 void configure_pins() {
     // Set LED
@@ -56,231 +61,50 @@ void configure_pins() {
             .pull_up_en = GPIO_PULLUP_DISABLE
     };
     gpio_config(&led_pin);
-
 }
+
 
 /**
  * Read data from a load cell. Note that if the data is unable to be read, the
  * data will not be modified so the last set value will be used.
- * @param load_cell_t
- * @param output
+ * @param load_cell_t Pointer to hx711_t to read
+ * @param output Pointer to int32_t to output value
+ * @return esp_err_t
  */
-void read_load_cell_data(hx711_t* load_cell_t, int32_t* output) {
-    esp_err_t r = hx711_wait(load_cell_t, LOAD_CELL_WAIT_TIMEOUT_MS);
-    if (r != ESP_OK) {
-        printf("Load cell was not ready\n");
-        return;
+esp_err_t read_load_cell_data(hx711_t* load_cell_t, int32_t* output) {
+    esp_err_t err = hx711_wait(load_cell_t, LOAD_CELL_READ_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        return err;
     }
-    r = hx711_read_data(load_cell_t, output);
-    if (r != ESP_OK) {
-        printf("Unable to read load cell data\n");
+    err = hx711_read_data(load_cell_t, output);
+    return err;
+}
+
+
+/**
+ * Initialize wifi. Note that the Wifi radio must be turned on by calling this
+ * function if you desire to use ESP-NOW, even if you will NOT be connecting
+ * this ESP to a wifi network.
+ */
+void init_wifi () {
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_err_t err = esp_wifi_init(&cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize Wifi!");
     }
-}
-
-
-/**
- * Publish the value of the scales
- */
-void publish_scale_values() {
-    int32_t raw_values[8]; // Array for storing all values
-    // Get shelf 0
-    read_load_cell_data(&slot_0_upper, &raw_values[0]);
-    read_load_cell_data(&slot_0_lower, &raw_values[1]);
-    read_load_cell_data(&slot_1_upper, &raw_values[2]);
-    read_load_cell_data(&slot_1_lower, &raw_values[3]);
-    read_load_cell_data(&slot_2_upper, &raw_values[4]);
-    read_load_cell_data(&slot_2_lower, &raw_values[5]);
-    read_load_cell_data(&slot_3_upper, &raw_values[6]);
-    read_load_cell_data(&slot_3_lower, &raw_values[7]);
-
-
-    // Calculate the sum of the values for each scale, and multiply by the
-    // scaling factor.
-    double slot_values[4];
-    slot_values[0] = (raw_values[0] + raw_values[1]) * LOAD_CELL_SCALING_FACTOR;
-    slot_values[1] = (raw_values[2] + raw_values[3]) * LOAD_CELL_SCALING_FACTOR;
-    slot_values[2] = (raw_values[4] + raw_values[5]) * LOAD_CELL_SCALING_FACTOR;
-    slot_values[3] = (raw_values[6] + raw_values[7]) * LOAD_CELL_SCALING_FACTOR;
-
-    // Copy the message into the buffer
-    char payload_buffer[250];
-    sprintf(
-            payload_buffer,
-            "{\n"
-            "\t\"id\": \"%s\",\n"
-            "\t\"data\": [%lf, %lf, %lf, %lf]\n"
-            "}\n",
-            mac_address_str,
-            slot_values[0],
-            slot_values[1],
-            slot_values[2],
-            slot_values[3]
-    );
-    if (mqtt_client) {
-        esp_mqtt_client_publish(mqtt_client, SHELF_DATA_TOPIC, payload_buffer, 0, 1, 0);
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set Wifi mode");
     }
-}
-
-
-/**
- * Task for publishing scale values. Can be created by xTaskCreate
- * @param pvParameters
- */
-_Noreturn void publish_scale_values_task(void *pvParameters) {
-
-    // Initialize all load cell
-    slot_0_upper.dout = SLOT_0_UPPER_PIN;
-    slot_0_upper.pd_sck = LC_CLOCK_PIN;
-    slot_0_upper.gain = HX711_GAIN_A_64;
-    ESP_ERROR_CHECK(hx711_init(&slot_0_upper));
-
-    slot_0_lower.dout = SLOT_0_LOWER_PIN;
-    slot_0_lower.pd_sck = LC_CLOCK_PIN;
-    slot_0_lower.gain = HX711_GAIN_A_64;
-    ESP_ERROR_CHECK(hx711_init(&slot_0_lower));
-
-    slot_1_upper.dout = SLOT_1_UPPER_PIN,
-    slot_1_upper.pd_sck = LC_CLOCK_PIN;
-    slot_1_upper.gain = HX711_GAIN_A_64;
-    ESP_ERROR_CHECK(hx711_init(&slot_1_upper));
-
-    slot_1_lower.dout = SLOT_1_LOWER_PIN;
-    slot_1_lower.pd_sck = LC_CLOCK_PIN;
-    slot_1_lower.gain = HX711_GAIN_A_64;
-    ESP_ERROR_CHECK(hx711_init(&slot_1_lower));
-
-    slot_2_upper.dout = SLOT_2_UPPER_PIN;
-    slot_2_upper.pd_sck = LC_CLOCK_PIN;
-    slot_2_upper.gain = HX711_GAIN_A_64;
-    ESP_ERROR_CHECK(hx711_init(&slot_2_upper));
-
-    slot_2_lower.dout = SLOT_2_LOWER_PIN,
-    slot_2_lower.pd_sck = LC_CLOCK_PIN;
-    slot_2_lower.gain = HX711_GAIN_A_64;
-    ESP_ERROR_CHECK(hx711_init(&slot_2_lower));
-
-    slot_3_upper.dout = SLOT_3_UPPER_PIN;
-    slot_3_upper.pd_sck = LC_CLOCK_PIN;
-    slot_3_upper.gain = HX711_GAIN_A_64;
-    ESP_ERROR_CHECK(hx711_init(&slot_3_upper));
-
-    slot_3_lower.dout = SLOT_3_LOWER_PIN;
-    slot_3_lower.pd_sck = LC_CLOCK_PIN;
-    slot_3_lower.gain = HX711_GAIN_A_64;
-    ESP_ERROR_CHECK(hx711_init(&slot_3_lower));
-
-    // Continuously read the values
-    while(1) {
-        publish_scale_values();
-        vTaskDelay(pdMS_TO_TICKS(WEIGHT_POLLING_DELAY_MS));
+    err = esp_wifi_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start Wifi");
     }
-}
+    err = esp_now_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start ESP-NOW");
 
-
-/**
- * Callback to handle wifi events
- * @param event_handler_arg
- * @param event_base
- * @param event_id
- * @param event_data
- */
-int retry_num = 0;
-static void wifi_event_handler(void * event_handler_arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
-    if (event_id == WIFI_EVENT_STA_START) {
-        printf("Wifi connecting...\n");
-    } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
-        printf("Wifi connected\n");
-        retry_num = 0;
-        gpio_set_level(LED_PIN, 1);
-    } else if(event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        printf("Wifi lost connection\n");
-        esp_wifi_connect();
-        printf("Trying to reconnect... (%d)\n", retry_num);
-        // Flash LED based on the retry number
-        if(retry_num % 2 == 0) {
-            gpio_set_level(LED_PIN, 0);
-        } else {
-            gpio_set_level(LED_PIN, 1);
-        }
-        retry_num++;
-    } else if (event_id == IP_EVENT_STA_GOT_IP) {
-        printf("Wifi got IP\n");
     }
-}
-
-
-/**
- * Callback to handle incoming MQTT events
- * @param event The event to handle
- * @return
- */
-static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event) {
-    // Extract the client from the event
-    esp_mqtt_client_handle_t client = event->client;
-    // Handle different event types
-    switch (event->event_id) {
-        case MQTT_EVENT_CONNECTED:
-            // On connection, subscribe to the topics
-            break;
-        case MQTT_EVENT_DATA:
-            // Handle topics
-            break;
-        default:
-            break;
-    }
-    return ESP_OK;
-}
-
-
-/**
- * Wrapper function for the mqtt_event_handler
- * @param handler_args
- * @param event_id
- * @param event_data
- */
-static void mqtt_event_handler_wrapper(void *handler_args, esp_event_base_t event_base, int32_t event_id, void *event_data) {
-    mqtt_event_handler((esp_mqtt_event_handle_t) event_data);
-}
-
-
-/**
- * Start the MQTT portion of the app
- */
-void mqtt_app_start() {
-    // Create MQTT client
-    esp_mqtt_client_config_t mqtt_cfg = {
-            .broker.address.uri = MQTT_BROKER_URI
-    };
-    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-
-    // Register callback for events
-    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler_wrapper, NULL);
-    ESP_ERROR_CHECK(esp_mqtt_client_start(mqtt_client));
-}
-
-/**
- * Connect to Wifi
- * @param wifi_ssid
- * @param wifi_pass
- */
-void wifi_connection(const char* wifi_ssid, const char* wifi_pass) {
-    esp_netif_init();
-    esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
-    wifi_init_config_t wifi_cfg_default = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&wifi_cfg_default);
-    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
-    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
-    wifi_config_t wifi_cfg = {
-            .sta.ssid = "",
-            .sta.password = "",
-    };
-    strcpy((char*)wifi_cfg.sta.ssid, wifi_ssid);
-    strcpy((char*)wifi_cfg.sta.password, wifi_pass);
-    esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_cfg);
-    esp_wifi_start();
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_connect();
 }
 
 
@@ -296,31 +120,137 @@ void store_mac_address() {
 
 
 /**
+ * Initialized the load cells.
+ */
+void init_load_cells() {
+    slot_0_upper.dout = SLOT_0_UPPER_PIN;
+    slot_0_upper.pd_sck = LC_CLOCK_PIN;
+    slot_0_upper.gain = HX711_GAIN_A_64;
+    ESP_ERROR_CHECK(hx711_init(&slot_0_upper));
+
+    slot_0_lower.dout = SLOT_0_LOWER_PIN;
+    slot_0_lower.pd_sck = LC_CLOCK_PIN;
+    slot_0_lower.gain = HX711_GAIN_A_64;
+    ESP_ERROR_CHECK(hx711_init(&slot_0_lower));
+
+    slot_1_upper.dout = SLOT_1_UPPER_PIN,
+            slot_1_upper.pd_sck = LC_CLOCK_PIN;
+    slot_1_upper.gain = HX711_GAIN_A_64;
+    ESP_ERROR_CHECK(hx711_init(&slot_1_upper));
+
+    slot_1_lower.dout = SLOT_1_LOWER_PIN;
+    slot_1_lower.pd_sck = LC_CLOCK_PIN;
+    slot_1_lower.gain = HX711_GAIN_A_64;
+    ESP_ERROR_CHECK(hx711_init(&slot_1_lower));
+
+    slot_2_upper.dout = SLOT_2_UPPER_PIN;
+    slot_2_upper.pd_sck = LC_CLOCK_PIN;
+    slot_2_upper.gain = HX711_GAIN_A_64;
+    ESP_ERROR_CHECK(hx711_init(&slot_2_upper));
+
+    slot_2_lower.dout = SLOT_2_LOWER_PIN,
+            slot_2_lower.pd_sck = LC_CLOCK_PIN;
+    slot_2_lower.gain = HX711_GAIN_A_64;
+    ESP_ERROR_CHECK(hx711_init(&slot_2_lower));
+
+    slot_3_upper.dout = SLOT_3_UPPER_PIN;
+    slot_3_upper.pd_sck = LC_CLOCK_PIN;
+    slot_3_upper.gain = HX711_GAIN_A_64;
+    ESP_ERROR_CHECK(hx711_init(&slot_3_upper));
+
+    slot_3_lower.dout = SLOT_3_LOWER_PIN;
+    slot_3_lower.pd_sck = LC_CLOCK_PIN;
+    slot_3_lower.gain = HX711_GAIN_A_64;
+    ESP_ERROR_CHECK(hx711_init(&slot_3_lower));
+}
+
+
+static void pack_int32_to_int8(const int32_t *src, uint8_t *dst, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        int32_t val = src[i];
+        dst[i * 4 + 0] = (uint8_t)((val >> 0) & 0xFF);
+        dst[i * 4 + 1] = (uint8_t)((val >> 8) & 0xFF);
+        dst[i * 4 + 2] = (uint8_t)((val >> 16) & 0xFF);
+        dst[i * 4 + 3] = (uint8_t)((val >> 24) & 0xFF);
+    }
+}
+
+
+/**
+ * Task to get the weights from the load cells and send them over ESP-NOW.
+ * @param pvParameters parameters
+ * @return This function is a task and it will never return.
+ */
+_Noreturn void send_weights_task(void* pvParameters) {
+
+
+
+
+    while (1) {
+
+        // Read load cells
+        int32_t raw_values[8]; // Array for storing all values
+
+        // Get shelf 0
+        read_load_cell_data(&slot_0_upper, &raw_values[0]);
+        read_load_cell_data(&slot_0_lower, &raw_values[1]);
+        read_load_cell_data(&slot_1_upper, &raw_values[2]);
+        read_load_cell_data(&slot_1_lower, &raw_values[3]);
+        read_load_cell_data(&slot_2_upper, &raw_values[4]);
+        read_load_cell_data(&slot_2_lower, &raw_values[5]);
+        read_load_cell_data(&slot_3_upper, &raw_values[6]);
+        read_load_cell_data(&slot_3_lower, &raw_values[7]);
+
+        // TODO apply some kind of filtering on the edge
+
+        // Convert data from int32_t to int8_t
+        size_t count = sizeof(raw_values) / sizeof(raw_values[0]);
+        uint8_t data8[count*4];
+        pack_int32_to_int8(raw_values, data8, count);
+
+
+        esp_now_send(atlas_mac, data8, sizeof(data8));
+
+        vTaskDelay(pdMS_TO_TICKS(WEIGHT_UPDATE_DELAY_MS));
+    }
+
+}
+
+
+/**
  * Main function, runs once on app start.
  */
 void app_main(void)
 {
 
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    // Get Wifi SSID and password
-    const char *wifi_ssid = WIFI_SSID;
-    const char *wifi_pass = WIFI_PASS;
-
-    // Initialize Wifi
     nvs_flash_init();
-    wifi_connection(wifi_ssid, wifi_pass);
+    ESP_LOGD(TAG, "Initialized NVS");
 
-    // Store the mac address to send in MQTT messages
+    configure_pins();
+    ESP_LOGD(TAG, "Initialized GPIO");
+
+    init_wifi();
+    ESP_LOGD(TAG, "Initialized Wifi radio");
+
+
+    esp_now_init();
+    ESP_LOGD(TAG, "Initialized ESP-NOW");
+
     store_mac_address();
 
-    // Configure all GPIO pins
-    configure_pins();
+    init_load_cells();
+    ESP_LOGD(TAG, "Initialized load cells");
 
-    // Start the MQTT app
-    mqtt_app_start();
 
-    // Create the shelf data publishing task
-    xTaskCreate(&publish_scale_values_task, "publish_scale_values_task", 2048, NULL, 5, NULL);
+    // Add ESP-NOW peer (Atlas)
+    esp_now_peer_info_t en_peer_info = {
+            .channel = 0,
+            .ifidx = ESP_IF_WIFI_STA,
+            .encrypt = false
+    };
+    memcpy(en_peer_info.peer_addr, atlas_mac, ESP_NOW_ETH_ALEN);
+    if (!esp_now_is_peer_exist(atlas_mac)) {
+        esp_now_add_peer(&en_peer_info);
+    }
 
 }
