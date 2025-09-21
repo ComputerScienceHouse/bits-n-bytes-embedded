@@ -22,9 +22,11 @@
 #include "driver/uart.h"
 #include <string.h>
 #include "nvs_flash.h"
+#include "led_strip.h"
 
 // Pins
-#define LED_PIN 15
+#define INTERNAL_LED_PIN 2
+#define CABINET_LED_PIN 16
 #define DOOR_CONTROL_PIN 5
 #define LEFT_DOOR_UPPER_SENSOR_PIN 23
 #define LEFT_DOOR_LOWER_SENSOR_PIN 19
@@ -45,6 +47,13 @@ static const int uart_rx_buffer_size = 1024;
 #define DOOR_TRIGGER_DELAY_MS 100 // Leaving latches open for too long is harmful
 #define HATCH_TRIGGER_DELAY_MS 100
 
+// LEDs
+#define NUM_LEDS 70
+led_strip_handle_t led_strip = NULL;
+
+
+static QueueHandle_t esp_now_queue;
+
 
 static const char* TAG = "atlas";
 
@@ -58,22 +67,22 @@ typedef struct {
  */
 void open_doors() {
     // Set the open doors last send to prevent this from triggering the doors open
-    gpio_set_level(LED_PIN, 0);
+    gpio_set_level(INTERNAL_LED_PIN, 0);
     gpio_set_level(DOOR_CONTROL_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(DOOR_TRIGGER_DELAY_MS));
     gpio_set_level(DOOR_CONTROL_PIN, 1);
-    gpio_set_level(LED_PIN, 1);
+    gpio_set_level(INTERNAL_LED_PIN, 1);
 }
 
 /**
  * Open the hatch
  */
 void open_hatch() {
-    gpio_set_level(LED_PIN, 0);
+    gpio_set_level(INTERNAL_LED_PIN, 0);
     gpio_set_level(HATCH_CONTROL_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(HATCH_TRIGGER_DELAY_MS));
     gpio_set_level(HATCH_CONTROL_PIN, 1);
-    gpio_set_level(LED_PIN, 1);
+    gpio_set_level(INTERNAL_LED_PIN, 1);
 }
 
 /**
@@ -126,6 +135,34 @@ bool is_hatch_closed() {
 }
 
 
+
+void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+    if (!data || len <= 0) return;
+
+    esp_now_msg_t msg;
+    if (len > sizeof(msg.data)) len = sizeof(msg.data);
+    memcpy(msg.data, data, len);
+    msg.len = len;
+
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xQueueSendFromISR(esp_now_queue, &msg, &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
+}
+
+void esp_now_task(void *pvParameter) {
+    esp_now_msg_t msg;
+    while (true) {
+        if (xQueueReceive(esp_now_queue, &msg, portMAX_DELAY)) {
+            ESP_LOGI(TAG, "Received %d bytes over ESP-NOW", msg.len);
+            for (size_t i = 0; i < msg.len; i++) {
+                ESP_LOGI(TAG, "%d", msg.data[i]);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+
 /**
  * Configure GPIO pins.
  */
@@ -158,7 +195,7 @@ void configure_pins() {
     gpio_config_t led_pin_conf = {
             .intr_type = GPIO_INTR_DISABLE,
             .mode = GPIO_MODE_OUTPUT,
-            .pin_bit_mask = (1ULL << LED_PIN),
+            .pin_bit_mask = (1ULL << INTERNAL_LED_PIN),
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .pull_up_en = GPIO_PULLUP_DISABLE
     };
@@ -214,33 +251,47 @@ void init_uart() {
 }
 
 
-static QueueHandle_t esp_now_queue;
+/**
+ * Initialize the LEDs.
+ */
+void init_leds() {
 
-void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
-    if (!data || len <= 0) return;
-
-    esp_now_msg_t msg;
-    if (len > sizeof(msg.data)) len = sizeof(msg.data);
-    memcpy(msg.data, data, len);
-    msg.len = len;
-
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xQueueSendFromISR(esp_now_queue, &msg, &xHigherPriorityTaskWoken);
-    if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
-}
-
-void esp_now_task(void *pvParameter) {
-    esp_now_msg_t msg;
-    while (true) {
-        if (xQueueReceive(esp_now_queue, &msg, portMAX_DELAY)) {
-            ESP_LOGI(TAG, "Received %d bytes over ESP-NOW", msg.len);
-            for (size_t i = 0; i < msg.len; i++) {
-                ESP_LOGI(TAG, "%d", msg.data[i]);
+    led_strip_config_t strip_config = {
+            .strip_gpio_num = CABINET_LED_PIN,
+            .max_leds = NUM_LEDS,
+            .led_model = LED_MODEL_WS2812,
+            .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+            .flags = {
+                    .invert_out = false
             }
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
+    };
+    led_strip_rmt_config_t rmt_config = {
+            .clk_src = RMT_CLK_SRC_DEFAULT,
+            .resolution_hz = 10 * 1000 * 1000,
+            .flags.with_dma = false,
+    };
+    led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip);
+
 }
+
+
+_Noreturn void update_leds_task() {
+
+    while(1) {
+        for (int i = 0; i < NUM_LEDS; i++) {
+            led_strip_set_pixel(led_strip, i, 50, 0, 0);
+        }
+        led_strip_refresh(led_strip);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        for (int i = 0; i < NUM_LEDS; i++) {
+            led_strip_set_pixel(led_strip, i, 0, 0, 0);
+        }
+        led_strip_refresh(led_strip);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+}
+
 
 /**
  * Main app code. Runs once on boot.
@@ -266,9 +317,15 @@ void app_main(void)
     init_uart();
     ESP_LOGD(TAG, "Initialized UART");
 
+    init_leds();
+    ESP_LOGD(TAG, "Initialized LEDs");
+
+    xTaskCreate(update_leds_task, "update_leds_task", 4096, NULL, 5, NULL);
+
+
     esp_now_queue = xQueueCreate(10, sizeof(esp_now_msg_t));
-    esp_now_register_recv_cb(esp_now_recv_cb);
-    xTaskCreate(esp_now_task, "esp_now_task", 4096, NULL, 5, NULL);
+//    esp_now_register_recv_cb(esp_now_recv_cb);
+//    xTaskCreate(esp_now_task, "esp_now_task", 4096, NULL, 5, NULL);
 
 
 }
