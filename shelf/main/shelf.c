@@ -39,7 +39,7 @@ hx711_t slot_3_upper;
 hx711_t slot_3_lower;
 
 // TODO remove atlas mac, this should not be hardcoded
-uint8_t atlas_mac[ESP_NOW_ETH_ALEN] = {0x94, 0xB5, 0x55, 0x8E, 0x2A, 0x21};
+uint8_t atlas_mac[ESP_NOW_ETH_ALEN] = {0x30, 0xC6, 0xF7, 0x29, 0xE9, 0xC8};
 
 
 
@@ -211,6 +211,8 @@ _Noreturn void send_weights_task(void* pvParameters) {
 
         esp_now_send(atlas_mac, data8, sizeof(data8));
 
+        gpio_set_level(LED_PIN, 1);
+
         vTaskDelay(pdMS_TO_TICKS(WEIGHT_UPDATE_DELAY_MS));
     }
 
@@ -252,5 +254,7 @@ void app_main(void)
     if (!esp_now_is_peer_exist(atlas_mac)) {
         esp_now_add_peer(&en_peer_info);
     }
+
+    xTaskCreate(send_weights_task, "send_weights_task", 2048, NULL, 4, NULL);
 
 }

@@ -20,19 +20,21 @@
 #include "esp_wifi.h"
 #include "esp_now.h"
 #include "driver/uart.h"
+#include <string.h>
+#include "nvs_flash.h"
 
 // Pins
-#define LED_PIN 2
+#define LED_PIN 15
 #define DOOR_CONTROL_PIN 5
-#define LEFT_DOOR_UPPER_SENSOR_PIN 11
-#define LEFT_DOOR_LOWER_SENSOR_PIN 1
-#define RIGHT_DOOR_UPPER_SENSOR_PIN 9
-#define RIGHT_DOOR_LOWER_SENSOR_PIN 2
-#define HATCH_CONTROL_PIN 7
-#define HATCH_LEFT_SENSOR_PIN 3
+#define LEFT_DOOR_UPPER_SENSOR_PIN 23
+#define LEFT_DOOR_LOWER_SENSOR_PIN 19
+#define RIGHT_DOOR_UPPER_SENSOR_PIN 18
+#define RIGHT_DOOR_LOWER_SENSOR_PIN 26
+#define HATCH_CONTROL_PIN 32
+#define HATCH_LEFT_SENSOR_PIN 12
 #define HATCH_RIGHT_SENSOR_PIN 4
-#define UART_TX_PIN 1
-#define UART_RX_PIN 2
+#define UART_TX_PIN 9
+#define UART_RX_PIN 10
 
 // UART
 #define UART_PORT_NUM 1
@@ -45,6 +47,11 @@ static const int uart_rx_buffer_size = 1024;
 
 
 static const char* TAG = "atlas";
+
+typedef struct {
+    uint8_t data[250];
+    int len;
+} esp_now_msg_t;
 
 /**
  * Open the doors
@@ -151,7 +158,7 @@ void configure_pins() {
     gpio_config_t led_pin_conf = {
             .intr_type = GPIO_INTR_DISABLE,
             .mode = GPIO_MODE_OUTPUT,
-            .pin_bit_mask = 1ULL < LED_PIN,
+            .pin_bit_mask = (1ULL << LED_PIN),
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .pull_up_en = GPIO_PULLUP_DISABLE
     };
@@ -166,6 +173,8 @@ void configure_pins() {
  */
 void init_wifi () {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_netif_init();
+    esp_event_loop_create_default();
     esp_err_t err = esp_wifi_init(&cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize Wifi!");
@@ -197,13 +206,41 @@ void init_uart() {
             .data_bits = UART_DATA_8_BITS,
             .parity = UART_PARITY_DISABLE,
             .stop_bits = UART_STOP_BITS_1,
-            .flow_ctrl = UART_HW_FLOWCTRL_CTS_RTS,
+            .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
             .rx_flow_ctrl_thresh = 122
     };
     ESP_ERROR_CHECK(uart_param_config(uart_num, &uart_cfg));
     ESP_ERROR_CHECK(uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 }
 
+
+static QueueHandle_t esp_now_queue;
+
+void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+    if (!data || len <= 0) return;
+
+    esp_now_msg_t msg;
+    if (len > sizeof(msg.data)) len = sizeof(msg.data);
+    memcpy(msg.data, data, len);
+    msg.len = len;
+
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xQueueSendFromISR(esp_now_queue, &msg, &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
+}
+
+void esp_now_task(void *pvParameter) {
+    esp_now_msg_t msg;
+    while (true) {
+        if (xQueueReceive(esp_now_queue, &msg, portMAX_DELAY)) {
+            ESP_LOGI(TAG, "Received %d bytes over ESP-NOW", msg.len);
+            for (size_t i = 0; i < msg.len; i++) {
+                ESP_LOGI(TAG, "%d", msg.data[i]);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
 
 /**
  * Main app code. Runs once on boot.
@@ -218,6 +255,8 @@ void app_main(void)
     gpio_set_level(DOOR_CONTROL_PIN, 1);
     gpio_set_level(HATCH_CONTROL_PIN, 1);
 
+    nvs_flash_init();
+
     configure_pins();
     ESP_LOGD(TAG, "Initialized GPIO");
 
@@ -226,6 +265,10 @@ void app_main(void)
 
     init_uart();
     ESP_LOGD(TAG, "Initialized UART");
+
+    esp_now_queue = xQueueCreate(10, sizeof(esp_now_msg_t));
+    esp_now_register_recv_cb(esp_now_recv_cb);
+    xTaskCreate(esp_now_task, "esp_now_task", 4096, NULL, 5, NULL);
 
 
 }
