@@ -48,7 +48,7 @@ static const int uart_rx_buffer_size = 1024;
 #define HATCH_TRIGGER_DELAY_MS 100
 
 // LEDs
-#define NUM_LEDS 70
+#define NUM_LEDS 128 // Number of LEDs on each side of the cabinet (individual strips)
 led_strip_handle_t led_strip = NULL;
 
 
