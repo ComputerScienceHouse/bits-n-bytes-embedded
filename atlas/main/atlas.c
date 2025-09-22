@@ -23,6 +23,7 @@
 #include <string.h>
 #include "nvs_flash.h"
 #include "led_strip.h"
+#include <math.h>
 
 // Pins
 #define INTERNAL_LED_PIN 2
@@ -271,26 +272,76 @@ void init_leds() {
             .flags.with_dma = false,
     };
     led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip);
-
 }
 
 
+/**
+ * Convert HSV to RGB.
+ * @param h float hue
+ * @param s float saturation
+ * @param v float value
+ * @param r pointer to uint8_t for red
+ * @param g pointer to uint8_t for green
+ * @param b pointer to uint8_t for blue
+ */
+static void hsv_to_rgb(float h, float s, float v, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    float c = v * s;
+    float x = c * (1 - fabsf(fmodf(h / 60.0f, 2) - 1));
+    float m = v - c;
+
+    float r1, g1, b1;
+    if (h < 60)      { r1 = c; g1 = x; b1 = 0; }
+    else if (h < 120){ r1 = x; g1 = c; b1 = 0; }
+    else if (h < 180){ r1 = 0; g1 = c; b1 = x; }
+    else if (h < 240){ r1 = 0; g1 = x; b1 = c; }
+    else if (h < 300){ r1 = x; g1 = 0; b1 = c; }
+    else             { r1 = c; g1 = 0; b1 = x; }
+
+    *r = (uint8_t)((r1 + m) * 255);
+    *g = (uint8_t)((g1 + m) * 255);
+    *b = (uint8_t)((b1 + m) * 255);
+}
+
+/**
+ * Task to update LEDs based on state of cabinet.
+ * @return This is a task and it will never return.
+ */
 _Noreturn void update_leds_task() {
 
-    while(1) {
-        for (int i = 0; i < NUM_LEDS; i++) {
-            led_strip_set_pixel(led_strip, i, 50, 0, 0);
-        }
-        led_strip_refresh(led_strip);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        for (int i = 0; i < NUM_LEDS; i++) {
-            led_strip_set_pixel(led_strip, i, 0, 0, 0);
-        }
-        led_strip_refresh(led_strip);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+    float hue_offset = 0.0f;
 
+    while(1) {
+        esp_err_t err;
+        if (are_doors_closed()) {
+            // Attract mode
+            for (int i = 0; i < NUM_LEDS; i++) {
+                uint8_t r, g, b;
+                float hue = fmodf(hue_offset + (360.0f * i / NUM_LEDS), 360.0f);
+                hsv_to_rgb(hue, 1.0f, 1.0f, &r, &g, &b);
+                err = led_strip_set_pixel(led_strip, i, r, g, b);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "Unable to set pixel %d of LED", i);
+                }
+            }
+            err = led_strip_refresh(led_strip);
+            if (err != ESP_OK) {
+
+            }
+            hue_offset = fmodf(hue_offset + 2.0f, 360.0f);
+            vTaskDelay(pdMS_TO_TICKS(50));
+        } else {
+            for (size_t i = 0; i < NUM_LEDS; i++) {
+                led_strip_set_pixel(led_strip, i, 255, 255, 255);
+            }
+            led_strip_refresh(led_strip);
+            // Task can be delayed longer, LED updates are not important
+            // (they stay the same while the doors are open).
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
 }
+
 
 
 /**
