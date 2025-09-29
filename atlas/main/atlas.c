@@ -24,6 +24,7 @@
 #include "nvs_flash.h"
 #include "led_strip.h"
 #include <math.h>
+#include "esp_timer.h"
 
 // Pins
 #define INTERNAL_LED_PIN 2
@@ -303,33 +304,125 @@ static void hsv_to_rgb(float h, float s, float v, uint8_t *r, uint8_t *g, uint8_
     *b = (uint8_t)((b1 + m) * 255);
 }
 
+
+/**
+ * Rainbow effect for the LEDs. This function must be called in a loop, and the
+ * the hue_offset value must be stored and passed in each time this is called
+ * in order for the LEDs to fade properly.
+ * @param hue_offset Hue offset (result from last call of this function, use
+ * 0.0f if this is the first time this function is called).
+ * @return hue_offset to be stored and then passed into the next iteration.
+ */
+float leds_rainbow_chase(float hue_offset) {
+    esp_err_t err;
+    // Fast effect
+    for (int i = 0; i < NUM_LEDS; i++) {
+        uint8_t r, g, b;
+        float hue = fmodf(hue_offset + (360.0f * i / NUM_LEDS), 360.0f);
+        hsv_to_rgb(hue, 1.0f, 1.0f, &r, &g, &b);
+        err = led_strip_set_pixel(led_strip, i, r, g, b);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Unable to set pixel %d of LED", i);
+        }
+    }
+    err = led_strip_refresh(led_strip);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error refreshing LEDs in leds_rainbow_chase");
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+    // Update hue offset
+    hue_offset = fmodf(hue_offset + 2.0f, 360.0f);
+    return hue_offset;
+}
+
+
+/**
+ * Color chase of the official Bits 'n Bytes colors
+ * @param phase float phase to carry over from the last iteration
+ * @return float phase to carry over to the next iteration
+ */
+float leds_bnb_color_chase(float phase) {
+    esp_err_t err;
+    const int BLOCK_SIZE = 10;
+
+    int offset = ((int)phase) % (BLOCK_SIZE * 2); // wrap around
+
+    for (int i = 0; i < NUM_LEDS; i++) {
+        // Determine which block this LED is in
+        int block_index = (i + offset) / BLOCK_SIZE;
+
+        if (block_index % 2 == 0) {
+            // Orange block
+            err = led_strip_set_pixel(led_strip, i, 250, 25, 0);
+        } else {
+            // Purple block
+            err = led_strip_set_pixel(led_strip, i, 130, 0, 250);
+        }
+
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Unable to set pixel %d of LED", i);
+        }
+    }
+    err = led_strip_refresh(led_strip);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error refreshing LEDs in leds_red");
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+    return phase + 1;
+}
+
+
+float leds_rainbow_gradient(float hue) {
+    esp_err_t err;
+    uint8_t r, g, b;
+    hue = fmodf(hue + 2.0f, 360.0f);
+    for (int i = 0; i < NUM_LEDS; i++) {
+        hsv_to_rgb(hue, 1.0f, 1.0f, &r, &g, &b);
+        led_strip_set_pixel(led_strip, i, r, g, b);
+    }
+    err = led_strip_refresh(led_strip);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error refreshing LEDs in leds_red");
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+    return hue;
+}
+
+
+
 /**
  * Task to update LEDs based on state of cabinet.
  * @return This is a task and it will never return.
  */
 _Noreturn void update_leds_task() {
 
-    float hue_offset = 0.0f;
+    // Array of all effects to cycle through
+    float (*effects[])(float) = {leds_rainbow_chase, leds_bnb_color_chase, leds_rainbow_gradient};
+    // An effect might need to store a value for it to reference each
+    // time the effect is called (e.g. current hue for rainbow effect)
+    float fx_val_store = 0.0f;
+
+    uint16_t current_effect = 0;
+
+    int effect_switch_ms = 7000;
+    int64_t effect_last_changed = 0;
 
     while(1) {
-        esp_err_t err;
         if (are_doors_closed()) {
-            // Attract mode
-            for (int i = 0; i < NUM_LEDS; i++) {
-                uint8_t r, g, b;
-                float hue = fmodf(hue_offset + (360.0f * i / NUM_LEDS), 360.0f);
-                hsv_to_rgb(hue, 1.0f, 1.0f, &r, &g, &b);
-                err = led_strip_set_pixel(led_strip, i, r, g, b);
-                if (err != ESP_OK) {
-                    ESP_LOGE(TAG, "Unable to set pixel %d of LED", i);
-                }
-            }
-            err = led_strip_refresh(led_strip);
-            if (err != ESP_OK) {
+            // Attract mode: Do cool effects
 
+            // Check if it's time to switch effects
+            int64_t current_time_ms = esp_timer_get_time() / 1000;
+            if (current_time_ms - effect_last_changed > effect_switch_ms) {
+                // Switch effects
+                current_effect = (current_effect + 1) % (sizeof(effects) / sizeof(effects[0]));
+                effect_last_changed = current_time_ms;
+                fx_val_store = 0.0f;
             }
-            hue_offset = fmodf(hue_offset + 2.0f, 360.0f);
-            vTaskDelay(pdMS_TO_TICKS(50));
+
+            // Update LEDs based on current effect
+            fx_val_store = effects[current_effect](fx_val_store);
+
         } else {
             for (size_t i = 0; i < NUM_LEDS; i++) {
                 led_strip_set_pixel(led_strip, i, 255, 255, 255);
