@@ -10,7 +10,6 @@
  */
 
 // TODO add noctua fan contrOl
-// TODO add LED control
 // TODO discover shelves over ESP-NOW
 // TODO send/receive UART packets from raspberry pi
 
@@ -25,6 +24,7 @@
 #include "led_strip.h"
 #include <math.h>
 #include "esp_timer.h"
+#include "cJSON.h"
 
 // Pins
 #define INTERNAL_LED_PIN 2
@@ -41,9 +41,9 @@
 #define UART_RX_PIN 10
 
 // UART
-#define UART_PORT_NUM 1
-#define UART_BAUD_RATE 115200
-static const int uart_rx_buffer_size = 1024;
+#define PI_UART_PORT_NUM 1
+#define PI_UART_BAUD_RATE 115200
+static const int pi_uart_rx_buffer_size = 1024;
 
 // Timing
 #define DOOR_TRIGGER_DELAY_MS 100 // Leaving latches open for too long is harmful
@@ -51,18 +51,21 @@ static const int uart_rx_buffer_size = 1024;
 
 // LEDs
 #define NUM_LEDS 128 // Number of LEDs on each side of the cabinet (individual strips)
+
+// Tag for log messages
+static const char* TAG = "atlas";
+
+// Handle for cabinet LED strip
 led_strip_handle_t led_strip = NULL;
 
 
-static QueueHandle_t esp_now_queue;
-
-
-static const char* TAG = "atlas";
-
+// ESP-NOW
+static QueueHandle_t esp_now_q;
 typedef struct {
     uint8_t data[250];
     int len;
 } esp_now_msg_t;
+
 
 /**
  * Open the doors
@@ -147,14 +150,14 @@ void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int l
     msg.len = len;
 
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xQueueSendFromISR(esp_now_queue, &msg, &xHigherPriorityTaskWoken);
+    xQueueSendFromISR(esp_now_q, &msg, &xHigherPriorityTaskWoken);
     if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
 }
 
 void esp_now_task(void *pvParameter) {
     esp_now_msg_t msg;
     while (true) {
-        if (xQueueReceive(esp_now_queue, &msg, portMAX_DELAY)) {
+        if (xQueueReceive(esp_now_q, &msg, portMAX_DELAY)) {
             ESP_LOGI(TAG, "Received %d bytes over ESP-NOW", msg.len);
             for (size_t i = 0; i < msg.len; i++) {
                 ESP_LOGI(TAG, "%d", msg.data[i]);
@@ -238,10 +241,10 @@ void init_wifi () {
  * Initialize UART.
  */
 void init_uart() {
-    ESP_ERROR_CHECK(uart_driver_install(UART_PORT_NUM, uart_rx_buffer_size, 0, 0, NULL, 0));
-    const uart_port_t uart_num = UART_PORT_NUM;
+    ESP_ERROR_CHECK(uart_driver_install(PI_UART_PORT_NUM, pi_uart_rx_buffer_size, 0, 0, NULL, 0));
+    const uart_port_t uart_num = PI_UART_PORT_NUM;
     uart_config_t uart_cfg = {
-            .baud_rate = UART_BAUD_RATE,
+            .baud_rate = PI_UART_BAUD_RATE,
             .data_bits = UART_DATA_8_BITS,
             .parity = UART_PARITY_DISABLE,
             .stop_bits = UART_STOP_BITS_1,
@@ -249,7 +252,7 @@ void init_uart() {
             .rx_flow_ctrl_thresh = 122
     };
     ESP_ERROR_CHECK(uart_param_config(uart_num, &uart_cfg));
-    ESP_ERROR_CHECK(uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_set_pin(PI_UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 }
 
 
@@ -435,6 +438,94 @@ _Noreturn void update_leds_task() {
     }
 }
 
+/**
+ * One-shot task to open the doors.
+ */
+void open_doors_task() {
+    open_doors();
+    vTaskDelete(NULL);
+}
+
+/**
+ * One-shot task to open the hatch.
+ */
+void open_hatch_task() {
+    open_hatch();
+    vTaskDelete(NULL);
+}
+
+
+/**
+ * Task to read data from uart and write status.
+ * @return This is a task and it will never return.
+ */
+_Noreturn void controller_read_write_uart_status_task() {
+
+    const char* tag = "controller_uart";
+
+
+    while (1) {
+
+        esp_err_t err;
+
+        // Read packets from controller
+        char data[pi_uart_rx_buffer_size];
+        size_t length = 0;
+        err = uart_get_buffered_data_len(PI_UART_PORT_NUM, &length);
+        if (err != ESP_OK) {
+            // Skip to sending status
+            ESP_LOGW(tag, "Unable to get buffered data length");
+            goto send_statuses;
+        }
+        if (length > 0) {
+            err = uart_read_bytes(PI_UART_PORT_NUM, data, length, pdMS_TO_TICKS(10));
+            // Check for errors
+            if (err != ESP_OK) {
+                // Skip to sending status
+                ESP_LOGW(tag, "Unable to read UART");
+                goto send_statuses;
+            }
+
+            // Parse JSON
+            cJSON *json = cJSON_ParseWithLength(data, length);
+            if (json == NULL) {
+                ESP_LOGW(tag, "Unable to parse JSON");
+                goto send_statuses;
+            }
+            const cJSON *doors_item = NULL;
+            const cJSON *hatch_item = NULL;
+            doors_item = cJSON_GetObjectItem(json, "doors");
+            hatch_item = cJSON_GetObjectItem(json, "hatch");
+
+
+            // Check if doors need to be opened
+            if (!cJSON_IsBool(doors_item)) {
+                ESP_LOGW(tag, "JSON value for 'doors' is not a boolean.");
+            } else {
+                if (doors_item->valueint == 1) {
+                    // Schedule call to open doors
+                    xTaskCreate(open_doors_task, "open_doors_task", 1028, NULL, 5, NULL);
+                }
+            }
+
+            // Check if hatch needs to be opened
+            if (!cJSON_IsBool(hatch_item)) {
+                ESP_LOGW(tag, "JSON value for 'hatch' is not a boolean.");
+            } else {
+                if (hatch_item->valueint == 1) {
+                    // Schedule call to open hatch
+                    xTaskCreate(open_hatch_task, "open_hatch_task", 1028, NULL, 5, NULL);
+                }
+            }
+        }
+
+
+        send_statuses:
+        // TODO write statuses
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
 
 
 /**
@@ -464,10 +555,18 @@ void app_main(void)
     init_leds();
     ESP_LOGD(TAG, "Initialized LEDs");
 
-    xTaskCreate(update_leds_task, "update_leds_task", 4096, NULL, 5, NULL);
+    // Schedule LEDs control task
+    xTaskCreate(update_leds_task, "update_leds_task", 4096, NULL, 4, NULL);
 
 
-    esp_now_queue = xQueueCreate(10, sizeof(esp_now_msg_t));
+    // Schedule UART read/write tasks
+    xTaskCreate(controller_read_write_uart_status_task, "controller_read_write_task", 4096, NULL, 5, NULL);
+
+
+
+    // ESP-NOW
+
+    esp_now_q = xQueueCreate(10, sizeof(esp_now_msg_t));
 //    esp_now_register_recv_cb(esp_now_recv_cb);
 //    xTaskCreate(esp_now_task, "esp_now_task", 4096, NULL, 5, NULL);
 
