@@ -41,7 +41,7 @@
 #define UART_RX_PIN 10
 
 // UART
-#define PI_UART_PORT_NUM 1
+#define PI_UART_PORT_NUM 2
 #define PI_UART_BAUD_RATE 115200
 static const int pi_uart_rx_buffer_size = 1024;
 
@@ -478,13 +478,7 @@ _Noreturn void controller_read_write_uart_status_task() {
             goto send_statuses;
         }
         if (length > 0) {
-            err = uart_read_bytes(PI_UART_PORT_NUM, data, length, pdMS_TO_TICKS(10));
-            // Check for errors
-            if (err != ESP_OK) {
-                // Skip to sending status
-                ESP_LOGW(tag, "Unable to read UART");
-                goto send_statuses;
-            }
+            uart_read_bytes(PI_UART_PORT_NUM, data, length, pdMS_TO_TICKS(10));
 
             // Parse JSON
             cJSON *json = cJSON_ParseWithLength(data, length);
