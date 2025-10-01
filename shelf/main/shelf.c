@@ -17,16 +17,16 @@
 #define LOAD_CELL_SCALING_FACTOR 0.01
 
 // Pin definitions
-#define LED_PIN 15
-#define LC_CLOCK_PIN 2
-#define SLOT_0_UPPER_PIN 37
-#define SLOT_0_LOWER_PIN 35
-#define SLOT_1_UPPER_PIN 18
-#define SLOT_1_LOWER_PIN 33
-#define SLOT_2_UPPER_PIN 11
-#define SLOT_2_LOWER_PIN 9
-#define SLOT_3_UPPER_PIN 7
-#define SLOT_3_LOWER_PIN 5
+#define LED_PIN 2
+#define LC_CLOCK_PIN 16
+#define SLOT_0_UPPER_PIN 35
+#define SLOT_0_LOWER_PIN 33
+#define SLOT_1_UPPER_PIN 34
+#define SLOT_1_LOWER_PIN 14
+#define SLOT_2_UPPER_PIN 25
+#define SLOT_2_LOWER_PIN 32
+#define SLOT_3_UPPER_PIN 27
+#define SLOT_3_LOWER_PIN 4
 
 
 hx711_t slot_0_upper;
@@ -233,7 +233,6 @@ void app_main(void)
 
     init_wifi();
     ESP_LOGD(TAG, "Initialized Wifi radio");
-
 
     esp_now_init();
     ESP_LOGD(TAG, "Initialized ESP-NOW");
