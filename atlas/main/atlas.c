@@ -25,6 +25,7 @@
 #include <math.h>
 #include "esp_timer.h"
 #include "cJSON.h"
+#include "fans.h"
 
 // Pins
 #define INTERNAL_LED_PIN 2
@@ -542,6 +543,9 @@ void app_main(void)
 
     init_wifi();
     ESP_LOGD(TAG, "Initialized wifi radio");
+
+    fans_init();
+    ESP_LOGD(TAG, "Initialized fans");
 
     init_uart();
     ESP_LOGD(TAG, "Initialized UART");
