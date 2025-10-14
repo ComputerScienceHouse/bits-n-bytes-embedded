@@ -35,11 +35,11 @@ typedef struct {
     hx711_t *lower_load_cell;
 } slot_t ;
 
-slot_t slots[NUM_SLOTS];
+slot_t *slots = NULL;
 
 
 // TODO remove atlas mac, this should not be hardcoded
-uint8_t atlas_mac[ESP_NOW_ETH_ALEN] = {0x30, 0xC6, 0xF7, 0x29, 0xE9, 0xC8};
+uint8_t atlas_mac[ESP_NOW_ETH_ALEN] = {0x30, 0xC6, 0xF7, 0x29, 0xE1, 0x90};
 
 
 
@@ -124,7 +124,28 @@ void store_mac_address() {
  */
 void init_load_cells() {
 
+    // Allocate memory for slots
+    slots = heap_caps_malloc(NUM_SLOTS * sizeof(slot_t), MALLOC_CAP_DEFAULT);
+    if (slots == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate slots!");
+        abort();
+    }
+
+    memset(slots, 0, NUM_SLOTS * sizeof(slot_t));
+
     for (size_t i = 0; i < NUM_SLOTS; i++) {
+        // Allocate memory for hx711s
+        slots[i].upper_load_cell = heap_caps_malloc(sizeof(hx711_t), MALLOC_CAP_DEFAULT);
+        slots[i].lower_load_cell = heap_caps_malloc(sizeof(hx711_t), MALLOC_CAP_DEFAULT);
+
+        if (
+                slots[i].upper_load_cell == NULL ||
+                slots[i].lower_load_cell == NULL
+                ) {
+            ESP_LOGE(TAG, "Failed to allocate hx711s!");
+            abort();
+        }
+
         // Get hard coded pins
         int upper_pin, lower_pin;
         switch (i) {
