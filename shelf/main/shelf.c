@@ -10,11 +10,13 @@
 #include <esp_mac.h>
 #include "esp_log.h"
 #include "esp_now.h"
+#include "cJSON.h"
+
+#define NUM_SLOTS 4
 
 // Timing definition
 #define WEIGHT_UPDATE_DELAY_MS 250
 #define LOAD_CELL_READ_TIMEOUT_MS 125
-#define LOAD_CELL_SCALING_FACTOR 0.01
 
 // Pin definitions
 #define LED_PIN 2
@@ -28,15 +30,13 @@
 #define SLOT_3_UPPER_PIN 27
 #define SLOT_3_LOWER_PIN 4
 
+typedef struct {
+    hx711_t *upper_load_cell;
+    hx711_t *lower_load_cell;
+} slot_t ;
 
-hx711_t slot_0_upper;
-hx711_t slot_0_lower;
-hx711_t slot_1_upper;
-hx711_t slot_1_lower;
-hx711_t slot_2_upper;
-hx711_t slot_2_lower;
-hx711_t slot_3_upper;
-hx711_t slot_3_lower;
+slot_t slots[NUM_SLOTS];
+
 
 // TODO remove atlas mac, this should not be hardcoded
 uint8_t atlas_mac[ESP_NOW_ETH_ALEN] = {0x30, 0xC6, 0xF7, 0x29, 0xE9, 0xC8};
@@ -123,58 +123,42 @@ void store_mac_address() {
  * Initialized the load cells.
  */
 void init_load_cells() {
-    slot_0_upper.dout = SLOT_0_UPPER_PIN;
-    slot_0_upper.pd_sck = LC_CLOCK_PIN;
-    slot_0_upper.gain = HX711_GAIN_A_64;
-    ESP_ERROR_CHECK(hx711_init(&slot_0_upper));
 
-    slot_0_lower.dout = SLOT_0_LOWER_PIN;
-    slot_0_lower.pd_sck = LC_CLOCK_PIN;
-    slot_0_lower.gain = HX711_GAIN_A_64;
-    ESP_ERROR_CHECK(hx711_init(&slot_0_lower));
+    for (size_t i = 0; i < NUM_SLOTS; i++) {
+        // Get hard coded pins
+        int upper_pin, lower_pin;
+        switch (i) {
+            case 0:
+                lower_pin = SLOT_0_LOWER_PIN;
+                upper_pin = SLOT_0_UPPER_PIN;
+                break;
+            case 1:
+                lower_pin = SLOT_1_LOWER_PIN;
+                upper_pin = SLOT_1_UPPER_PIN;
+                break;
+            case 2:
+                lower_pin = SLOT_2_LOWER_PIN;
+                upper_pin = SLOT_2_UPPER_PIN;
+                break;
+            case 3:
+                lower_pin = SLOT_3_LOWER_PIN;
+                upper_pin = SLOT_3_UPPER_PIN;
+                break;
+            default:
+                ESP_LOGE(TAG, "Unable to initialize load cells in slot %d: Not enough pins defined", i);
+                return;
+        }
 
-    slot_1_upper.dout = SLOT_1_UPPER_PIN,
-            slot_1_upper.pd_sck = LC_CLOCK_PIN;
-    slot_1_upper.gain = HX711_GAIN_A_64;
-    ESP_ERROR_CHECK(hx711_init(&slot_1_upper));
+        slots[i].lower_load_cell->dout = lower_pin;
+        slots[i].lower_load_cell->pd_sck = LC_CLOCK_PIN;
+        slots[i].lower_load_cell->gain = HX711_GAIN_A_64;
 
-    slot_1_lower.dout = SLOT_1_LOWER_PIN;
-    slot_1_lower.pd_sck = LC_CLOCK_PIN;
-    slot_1_lower.gain = HX711_GAIN_A_64;
-    ESP_ERROR_CHECK(hx711_init(&slot_1_lower));
+        slots[i].upper_load_cell->dout = upper_pin;
+        slots[i].upper_load_cell->pd_sck = LC_CLOCK_PIN;
+        slots[i].upper_load_cell->gain = HX711_GAIN_A_64;
 
-    slot_2_upper.dout = SLOT_2_UPPER_PIN;
-    slot_2_upper.pd_sck = LC_CLOCK_PIN;
-    slot_2_upper.gain = HX711_GAIN_A_64;
-    ESP_ERROR_CHECK(hx711_init(&slot_2_upper));
-
-    slot_2_lower.dout = SLOT_2_LOWER_PIN,
-            slot_2_lower.pd_sck = LC_CLOCK_PIN;
-    slot_2_lower.gain = HX711_GAIN_A_64;
-    ESP_ERROR_CHECK(hx711_init(&slot_2_lower));
-
-    slot_3_upper.dout = SLOT_3_UPPER_PIN;
-    slot_3_upper.pd_sck = LC_CLOCK_PIN;
-    slot_3_upper.gain = HX711_GAIN_A_64;
-    ESP_ERROR_CHECK(hx711_init(&slot_3_upper));
-
-    slot_3_lower.dout = SLOT_3_LOWER_PIN;
-    slot_3_lower.pd_sck = LC_CLOCK_PIN;
-    slot_3_lower.gain = HX711_GAIN_A_64;
-    ESP_ERROR_CHECK(hx711_init(&slot_3_lower));
-}
-
-
-static void pack_int32_to_int8(const int32_t *src, uint8_t *dst, size_t count) {
-    for (size_t i = 0; i < count; i++) {
-        int32_t val = src[i];
-        dst[i * 4 + 0] = (uint8_t)((val >> 0) & 0xFF);
-        dst[i * 4 + 1] = (uint8_t)((val >> 8) & 0xFF);
-        dst[i * 4 + 2] = (uint8_t)((val >> 16) & 0xFF);
-        dst[i * 4 + 3] = (uint8_t)((val >> 24) & 0xFF);
     }
 }
-
 
 /**
  * Task to get the weights from the load cells and send them over ESP-NOW.
@@ -183,35 +167,36 @@ static void pack_int32_to_int8(const int32_t *src, uint8_t *dst, size_t count) {
  */
 _Noreturn void send_weights_task(void* pvParameters) {
 
-
-
-
     while (1) {
 
-        // Read load cells
-        int32_t raw_values[8]; // Array for storing all values
+        // Create JSON
+        cJSON *json = cJSON_CreateObject();
+        cJSON *shelves_array = cJSON_AddArrayToObject(json, "shelves");
 
-        // Get shelf 0
-        read_load_cell_data(&slot_0_upper, &raw_values[0]);
-        read_load_cell_data(&slot_0_lower, &raw_values[1]);
-        read_load_cell_data(&slot_1_upper, &raw_values[2]);
-        read_load_cell_data(&slot_1_lower, &raw_values[3]);
-        read_load_cell_data(&slot_2_upper, &raw_values[4]);
-        read_load_cell_data(&slot_2_lower, &raw_values[5]);
-        read_load_cell_data(&slot_3_upper, &raw_values[6]);
-        read_load_cell_data(&slot_3_lower, &raw_values[7]);
+        // Read load cell data for each slot
+        for (size_t i = 0; i < NUM_SLOTS; i++) {
+            int32_t upper, lower;
+            if (
+                    read_load_cell_data(slots[i].lower_load_cell, &lower) != ESP_OK ||
+                    read_load_cell_data(slots[i].upper_load_cell, &upper) != ESP_OK
+            )
+            {
+                // Error reading these load cells, add null value to data
+                ESP_LOGW(TAG, "Error reading load cells in slot %d", i);
+                cJSON_AddItemToArray(shelves_array, cJSON_CreateNull());
+            } else {
+                cJSON *weight_value = cJSON_CreateNumber((double)upper + (double)lower);
+                cJSON_AddItemToArray(shelves_array, weight_value);
+            }
+        }
 
-        // TODO apply some kind of filtering on the edge
+        // Send JSON data to Atlas ESP32
+        char *json_string = cJSON_Print(json);
+        esp_now_send(atlas_mac, (uint8_t*)json_string, strlen(json_string));
 
-        // Convert data from int32_t to int8_t
-        size_t count = sizeof(raw_values) / sizeof(raw_values[0]);
-        uint8_t data8[count*4];
-        pack_int32_to_int8(raw_values, data8, count);
-
-
-        esp_now_send(atlas_mac, data8, sizeof(data8));
-
-        gpio_set_level(LED_PIN, 1);
+        // Free all memory
+        free(json_string);
+        cJSON_Delete(json);
 
         vTaskDelay(pdMS_TO_TICKS(WEIGHT_UPDATE_DELAY_MS));
     }
