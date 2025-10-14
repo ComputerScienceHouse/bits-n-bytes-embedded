@@ -29,7 +29,7 @@
 
 // Pins
 #define INTERNAL_LED_PIN 2
-#define CABINET_LED_PIN 16
+#define CABINET_LED_PIN 14
 #define DOOR_CONTROL_PIN 5
 #define LEFT_DOOR_UPPER_SENSOR_PIN 23
 #define LEFT_DOOR_LOWER_SENSOR_PIN 19
@@ -38,13 +38,15 @@
 #define HATCH_CONTROL_PIN 32
 #define HATCH_LEFT_SENSOR_PIN 12
 #define HATCH_RIGHT_SENSOR_PIN 4
-#define UART_TX_PIN 9
-#define UART_RX_PIN 10
+#define UART_TX_PIN 17
+#define UART_RX_PIN 16
 
 // UART
 #define PI_UART_PORT_NUM 2
 #define PI_UART_BAUD_RATE 115200
 static const int pi_uart_rx_buffer_size = 1024;
+static const int pi_uart_tx_buffer_size = 1024;
+
 
 // Timing
 #define DOOR_TRIGGER_DELAY_MS 100 // Leaving latches open for too long is harmful
@@ -72,6 +74,7 @@ typedef struct {
  * Open the doors
  */
 void open_doors() {
+    ESP_LOGD(TAG, "Open doors");
     // Set the open doors last send to prevent this from triggering the doors open
     gpio_set_level(INTERNAL_LED_PIN, 0);
     gpio_set_level(DOOR_CONTROL_PIN, 0);
@@ -84,6 +87,8 @@ void open_doors() {
  * Open the hatch
  */
 void open_hatch() {
+    ESP_LOGD(TAG, "Open hatch");
+
     gpio_set_level(INTERNAL_LED_PIN, 0);
     gpio_set_level(HATCH_CONTROL_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(HATCH_TRIGGER_DELAY_MS));
@@ -140,31 +145,50 @@ bool is_hatch_closed() {
     return is_left_hatch_closed() && is_right_hatch_closed();
 }
 
-
-
+/**
+ * Callback ISR for when a messsage is received over ESP-NOW.
+ * @param info
+ * @param data
+ * @param len
+ */
 void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+    // Check if any data was sent
     if (!data || len <= 0) return;
 
+    // Create new message to be stored in the queue
     esp_now_msg_t msg;
     if (len > sizeof(msg.data)) len = sizeof(msg.data);
     memcpy(msg.data, data, len);
     msg.len = len;
 
+    // Send to queue from ISR
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     xQueueSendFromISR(esp_now_q, &msg, &xHigherPriorityTaskWoken);
     if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
 }
 
-void esp_now_task(void *pvParameter) {
+
+/**
+ * Task for processing messages received over ESP-NOW.
+ * @param pvParameter
+ * @return this is a task and it will never return.
+ */
+_Noreturn void esp_now_task(void *pvParameter) {
     esp_now_msg_t msg;
     while (true) {
         if (xQueueReceive(esp_now_q, &msg, portMAX_DELAY)) {
-            ESP_LOGI(TAG, "Received %d bytes over ESP-NOW", msg.len);
+
+            for (size_t i = 0; i < msg.len; i = i + 4) {
+
+            }
+
+
+
             for (size_t i = 0; i < msg.len; i++) {
                 ESP_LOGI(TAG, "%d", msg.data[i]);
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -242,7 +266,7 @@ void init_wifi () {
  * Initialize UART.
  */
 void init_uart() {
-    ESP_ERROR_CHECK(uart_driver_install(PI_UART_PORT_NUM, pi_uart_rx_buffer_size, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_driver_install(PI_UART_PORT_NUM, pi_uart_rx_buffer_size, pi_uart_tx_buffer_size, 0, NULL, 0));
     const uart_port_t uart_num = PI_UART_PORT_NUM;
     uart_config_t uart_cfg = {
             .baud_rate = PI_UART_BAUD_RATE,
@@ -456,11 +480,38 @@ void open_hatch_task() {
 }
 
 
+_Noreturn void send_status_to_pi_task() {
+
+
+    while (1) {
+
+        // Construct JSON packet
+        cJSON *json = cJSON_CreateObject();
+        cJSON_AddBoolToObject(json, "doors", are_doors_closed());
+        cJSON_AddBoolToObject(json, "hatch", is_hatch_closed());
+        cJSON_AddNumberToObject(json, "temp_c", 100);
+        cJSON_AddNumberToObject(json, "intake_rpm", 1000);
+        cJSON_AddNumberToObject(json, "exhaust_rpm", 1000);
+
+        // Send to Pi over uart
+        char *data = cJSON_PrintUnformatted(json);
+
+        uart_write_bytes(PI_UART_PORT_NUM, data, strlen(data));
+
+        // Free memory
+        free(data);
+        cJSON_Delete(json);
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+
 /**
- * Task to read data from uart and write status.
+ * Task to read data from uart
  * @return This is a task and it will never return.
  */
-_Noreturn void controller_read_write_uart_status_task() {
+_Noreturn void read_from_pi_task() {
 
     const char* tag = "controller_uart";
 
@@ -474,49 +525,48 @@ _Noreturn void controller_read_write_uart_status_task() {
         size_t length = 0;
         err = uart_get_buffered_data_len(PI_UART_PORT_NUM, &length);
         if (err != ESP_OK) {
-            // Skip to sending status
             ESP_LOGW(tag, "Unable to get buffered data length");
-            goto send_statuses;
-        }
-        if (length > 0) {
-            uart_read_bytes(PI_UART_PORT_NUM, data, length, pdMS_TO_TICKS(10));
+        } else {
+            // Read data
+            if (length > 0) {
+                uart_read_bytes(PI_UART_PORT_NUM, data, length, pdMS_TO_TICKS(10));
 
-            // Parse JSON
-            cJSON *json = cJSON_ParseWithLength(data, length);
-            if (json == NULL) {
-                ESP_LOGW(tag, "Unable to parse JSON");
-                goto send_statuses;
-            }
-            const cJSON *doors_item = NULL;
-            const cJSON *hatch_item = NULL;
-            doors_item = cJSON_GetObjectItem(json, "doors");
-            hatch_item = cJSON_GetObjectItem(json, "hatch");
-
-
-            // Check if doors need to be opened
-            if (!cJSON_IsBool(doors_item)) {
-                ESP_LOGW(tag, "JSON value for 'doors' is not a boolean.");
-            } else {
-                if (doors_item->valueint == 1) {
-                    // Schedule call to open doors
-                    xTaskCreate(open_doors_task, "open_doors_task", 1028, NULL, 5, NULL);
+                // Parse JSON
+                cJSON *json = cJSON_ParseWithLength(data, length);
+                if (json == NULL) {
+                    ESP_LOGW(tag, "Unable to parse JSON");
+                    goto free_json;
                 }
-            }
+                const cJSON *doors_item = NULL;
+                const cJSON *hatch_item = NULL;
+                doors_item = cJSON_GetObjectItem(json, "doors");
+                hatch_item = cJSON_GetObjectItem(json, "hatch");
 
-            // Check if hatch needs to be opened
-            if (!cJSON_IsBool(hatch_item)) {
-                ESP_LOGW(tag, "JSON value for 'hatch' is not a boolean.");
-            } else {
-                if (hatch_item->valueint == 1) {
-                    // Schedule call to open hatch
-                    xTaskCreate(open_hatch_task, "open_hatch_task", 1028, NULL, 5, NULL);
+
+                // Check if doors need to be opened
+                if (!cJSON_IsBool(doors_item)) {
+                    ESP_LOGW(tag, "JSON value for 'doors' is not a boolean.");
+                } else {
+                    if (doors_item->valueint == 1) {
+                        // Schedule call to open doors
+                        xTaskCreate(open_doors_task, "open_doors_task", 1028, NULL, 4, NULL);
+                    }
                 }
+
+                // Check if hatch needs to be opened
+                if (!cJSON_IsBool(hatch_item)) {
+                    ESP_LOGW(tag, "JSON value for 'hatch' is not a boolean.");
+                } else {
+                    if (hatch_item->valueint == 1) {
+                        // Schedule call to open hatch
+                        xTaskCreate(open_hatch_task, "open_hatch_task", 1028, NULL, 4, NULL);
+                    }
+                }
+free_json:
+                cJSON_Delete(json);
             }
         }
 
-
-        send_statuses:
-        // TODO write statuses
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
@@ -558,15 +608,14 @@ void app_main(void)
 
 
     // Schedule UART read/write tasks
-    xTaskCreate(controller_read_write_uart_status_task, "controller_read_write_task", 4096, NULL, 5, NULL);
-
-
+    xTaskCreate(read_from_pi_task, "read_from_pi_task", 4096, NULL, 4, NULL);
+    xTaskCreate(send_status_to_pi_task, "send_status_to_pi_task", 4096, NULL, 4, NULL);
 
     // ESP-NOW
 
-    esp_now_q = xQueueCreate(10, sizeof(esp_now_msg_t));
+//    esp_now_q = xQueueCreate(10, sizeof(esp_now_msg_t));
 //    esp_now_register_recv_cb(esp_now_recv_cb);
-//    xTaskCreate(esp_now_task, "esp_now_task", 4096, NULL, 5, NULL);
+//    xTaskCreate(esp_now_task, "esp_now_task", 4096, NULL, 4, NULL);
 
 
 }
