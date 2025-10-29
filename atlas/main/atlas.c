@@ -631,7 +631,7 @@ void app_main(void)
 
     // ESP-NOW
 
-    esp_now_q = xQueueCreate(10, sizeof(esp_now_msg_t));
+    esp_now_q = xQueueCreate(50, sizeof(esp_now_msg_t));
     esp_now_register_recv_cb(esp_now_recv_cb);
     xTaskCreate(esp_now_task, "esp_now_task", 4096, NULL, 4, NULL);
 
