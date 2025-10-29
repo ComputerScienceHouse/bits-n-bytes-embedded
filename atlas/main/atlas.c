@@ -174,21 +174,39 @@ void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int l
  * @return this is a task and it will never return.
  */
 _Noreturn void esp_now_task(void *pvParameter) {
+
     esp_now_msg_t msg;
+
     while (true) {
+
         if (xQueueReceive(esp_now_q, &msg, portMAX_DELAY)) {
 
-            for (size_t i = 0; i < msg.len; i = i + 4) {
-
+            // Make sure slots field exists
+            cJSON *json = cJSON_Parse((char*)msg.data);
+            if (!cJSON_HasObjectItem(json, "slots")) {
+                ESP_LOGW(TAG, "Received ESP-NOW msg with no slots field");
+                goto free_json;
             }
 
-
-
-            for (size_t i = 0; i < msg.len; i++) {
-                ESP_LOGI(TAG, "%d", msg.data[i]);
+            // Iterate through each slot
+            cJSON *slot_array = cJSON_GetObjectItem(json, "slots");
+            int num_slots = cJSON_GetArraySize(slot_array);
+            for (int i = 0; i < num_slots; i++) {
+                // Try to convert item to number
+                cJSON *item = cJSON_GetArrayItem(slot_array, i);
+                if (cJSON_IsNull(item)) {
+                    ESP_LOGW(TAG, "Received null value for slot %d of shelf %s", i, "INSERT_MAC_HERE");
+                } else if (!cJSON_IsNumber(item)) {
+                    ESP_LOGW(TAG, "Received non-numeric slot value");
+                } else {
+                    double value = cJSON_GetNumberValue(item);
+                    ESP_LOGD("ESP_VAL", "Slot: %d, value: %f", i, value);
+                }
             }
+            free_json:
+            cJSON_Delete(json);
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -613,9 +631,9 @@ void app_main(void)
 
     // ESP-NOW
 
-//    esp_now_q = xQueueCreate(10, sizeof(esp_now_msg_t));
-//    esp_now_register_recv_cb(esp_now_recv_cb);
-//    xTaskCreate(esp_now_task, "esp_now_task", 4096, NULL, 4, NULL);
+    esp_now_q = xQueueCreate(10, sizeof(esp_now_msg_t));
+    esp_now_register_recv_cb(esp_now_recv_cb);
+    xTaskCreate(esp_now_task, "esp_now_task", 4096, NULL, 4, NULL);
 
 
 }

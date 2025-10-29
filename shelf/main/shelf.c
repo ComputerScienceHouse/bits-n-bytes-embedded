@@ -173,11 +173,12 @@ void init_load_cells() {
         slots[i].lower_load_cell->dout = lower_pin;
         slots[i].lower_load_cell->pd_sck = LC_CLOCK_PIN;
         slots[i].lower_load_cell->gain = HX711_GAIN_A_64;
+        hx711_init(slots[i].lower_load_cell);
 
         slots[i].upper_load_cell->dout = upper_pin;
         slots[i].upper_load_cell->pd_sck = LC_CLOCK_PIN;
         slots[i].upper_load_cell->gain = HX711_GAIN_A_64;
-
+        hx711_init(slots[i].upper_load_cell);
     }
 }
 
@@ -192,27 +193,33 @@ _Noreturn void send_weights_task(void* pvParameters) {
 
         // Create JSON
         cJSON *json = cJSON_CreateObject();
-        cJSON *shelves_array = cJSON_AddArrayToObject(json, "shelves");
+        cJSON *shelves_array = cJSON_AddArrayToObject(json, "slots");
 
         // Read load cell data for each slot
         for (size_t i = 0; i < NUM_SLOTS; i++) {
             int32_t upper, lower;
-            if (
-                    read_load_cell_data(slots[i].lower_load_cell, &lower) != ESP_OK ||
-                    read_load_cell_data(slots[i].upper_load_cell, &upper) != ESP_OK
-            )
-            {
-                // Error reading these load cells, add null value to data
-                ESP_LOGW(TAG, "Error reading load cells in slot %d", i);
+            bool lower_ok = read_load_cell_data(slots[i].lower_load_cell, &lower) == ESP_OK;
+            bool upper_ok = read_load_cell_data(slots[i].upper_load_cell, &upper) == ESP_OK;
+            if (!lower_ok || !upper_ok) {
+                // Error reading lower load cell, add null value to data
+                if (!lower_ok && !upper_ok) {
+                    ESP_LOGW(TAG, "Error reading both load cells in slot %d", i);
+                } else if(!upper_ok) {
+                    ESP_LOGW(TAG, "Error reading upper load cell in slot %d", i);
+                } else {
+                    ESP_LOGW(TAG, "Error reading lower load cell in slot %d", i);
+                }
                 cJSON_AddItemToArray(shelves_array, cJSON_CreateNull());
             } else {
-                cJSON *weight_value = cJSON_CreateNumber((double)upper + (double)lower);
-                cJSON_AddItemToArray(shelves_array, weight_value);
+                double weight_value = (double)(upper + lower);
+                ESP_LOGD(TAG, "Slot %d weight value: %0.5f", i, weight_value);
+                cJSON *weight_value_json = cJSON_CreateNumber(weight_value);
+                cJSON_AddItemToArray(shelves_array, weight_value_json);
             }
         }
 
         // Send JSON data to Atlas ESP32
-        char *json_string = cJSON_Print(json);
+        char *json_string = cJSON_PrintUnformatted(json);
         esp_now_send(atlas_mac, (uint8_t*)json_string, strlen(json_string));
 
         // Free all memory
