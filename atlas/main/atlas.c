@@ -516,6 +516,9 @@ _Noreturn void send_status_to_pi_task() {
 
         uart_write_bytes(PI_UART_PORT_NUM, data, strlen(data));
 
+        char *terminator = "\n";
+        uart_write_bytes(PI_UART_PORT_NUM, terminator, 1);
+
         // Free memory
         free(data);
         cJSON_Delete(json);
