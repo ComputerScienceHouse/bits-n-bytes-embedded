@@ -520,7 +520,7 @@ _Noreturn void send_status_to_pi_task() {
         free(data);
         cJSON_Delete(json);
 
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(250));
     }
 }
 
