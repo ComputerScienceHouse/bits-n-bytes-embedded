@@ -42,7 +42,7 @@
 
 // UART
 #define PI_UART_PORT_NUM 2
-#define PI_UART_BAUD_RATE 115200
+#define PI_UART_BAUD_RATE 9600
 static const int pi_uart_rx_buffer_size = 1024;
 static const int pi_uart_tx_buffer_size = 1024;
 
@@ -549,7 +549,7 @@ _Noreturn void send_status_to_pi_task() {
         free(data);
         cJSON_Delete(json);
 
-        vTaskDelay(pdMS_TO_TICKS(250));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
