@@ -9,9 +9,7 @@
  * lifting, thus it is named Atlas.
  */
 
-// TODO add noctua fan contrOl
-// TODO discover shelves over ESP-NOW
-// TODO send/receive UART packets from raspberry pi
+// TODO add noctua fan control
 
 #include <stdio.h>
 #include "driver/gpio.h"
@@ -26,6 +24,7 @@
 #include "esp_timer.h"
 #include "cJSON.h"
 #include "fans.h"
+#include "shelf_manager.h"
 
 // Pins
 #define INTERNAL_LED_PIN 2
@@ -47,6 +46,8 @@
 static const int pi_uart_rx_buffer_size = 1024;
 static const int pi_uart_tx_buffer_size = 1024;
 
+// Shelves
+#define MAX_NUM_SHELVES
 
 // Timing
 #define DOOR_TRIGGER_DELAY_MS 100 // Leaving latches open for too long is harmful
@@ -54,6 +55,9 @@ static const int pi_uart_tx_buffer_size = 1024;
 
 // LEDs
 #define NUM_LEDS 128 // Number of LEDs on each side of the cabinet (individual strips)
+
+// Other
+#define MAC_ADDRESS_LENGTH 6
 
 // Tag for log messages
 static const char* TAG = "atlas";
@@ -65,9 +69,14 @@ led_strip_handle_t led_strip = NULL;
 // ESP-NOW
 static QueueHandle_t esp_now_q;
 typedef struct {
-    uint8_t data[250];
+    int64_t recv_time;
     int len;
+    uint8_t sender_mac[MAC_ADDRESS_LENGTH];
+    uint8_t destination_mac[MAC_ADDRESS_LENGTH];
+    uint8_t data[250];
 } esp_now_msg_t;
+
+
 
 
 /**
@@ -155,11 +164,16 @@ void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int l
     // Check if any data was sent
     if (!data || len <= 0) return;
 
+    int64_t recv_time = esp_timer_get_time();
+
     // Create new message to be stored in the queue
     esp_now_msg_t msg;
     if (len > sizeof(msg.data)) len = sizeof(msg.data);
     memcpy(msg.data, data, len);
     msg.len = len;
+    msg.recv_time = recv_time;
+    memcpy(msg.sender_mac, info->src_addr, MAC_ADDRESS_LENGTH);
+    memcpy(msg.destination_mac, info->des_addr, MAC_ADDRESS_LENGTH);
 
     // Send to queue from ISR
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -200,7 +214,14 @@ _Noreturn void esp_now_task(void *pvParameter) {
                     ESP_LOGW(TAG, "Received non-numeric slot value");
                 } else {
                     double value = cJSON_GetNumberValue(item);
-                    ESP_LOGD("ESP_VAL", "Slot: %d, value: %f", i, value);
+//                    ESP_LOGD("ESP_VAL", "Slot: %d, value: %f", i, value);
+                    // TODO use slot weight value (process it or add it to a queue to send to the Jetson)
+                }
+                // Update shelf manager with this shelf
+                if (!sm_is_shelf_connected(msg.sender_mac)) {
+                    sm_add_shelf(msg.sender_mac, msg.recv_time);
+                } else {
+                    sm_update_shelf_time(msg.sender_mac, msg.recv_time);
                 }
             }
             free_json:
@@ -510,6 +531,11 @@ _Noreturn void send_status_to_pi_task() {
         cJSON_AddNumberToObject(json, "temp_c", 100);
         cJSON_AddNumberToObject(json, "intake_rpm", 1000);
         cJSON_AddNumberToObject(json, "exhaust_rpm", 1000);
+        // Add connected shelves
+
+
+
+        // TODO send connected shelf IDs to the pi
 
         // Send to Pi over uart
         char *data = cJSON_PrintUnformatted(json);
@@ -525,6 +551,42 @@ _Noreturn void send_status_to_pi_task() {
 
         vTaskDelay(pdMS_TO_TICKS(250));
     }
+}
+
+/**
+ * Parse a MAC address from a string into a 6 byte array.
+ * @param mac_str String MAC address
+ * @param mac_out Pointer to 6 byte output
+ * @return ESP_OK if successfully translated, ESP_ERR_INVALID_ARG otherwise.
+ */
+static esp_err_t parse_mac_str(const char*mac_str, uint8_t *mac_out) {
+    int num_converted = sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                 &mac_out[0], &mac_out[1], &mac_out[2],
+                 &mac_out[3], &mac_out[4], &mac_out[5]);
+    if (num_converted != 6) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return ESP_OK;
+}
+
+
+/**
+ * Send calibration data to a shelf.
+ * @param mac_address The mac address of the shelf, as a 6 byte uint8_t
+ * @param slot_id The ID of the slot to calibrate
+ * @param weight_g The calibration value used
+ */
+void task_send_calibration_to_shelf(uint8_t* mac_address, int slot_id, double weight_g) {
+    // Construct JSON
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddNumberToObject(json, "shelf_id", slot_id);
+    cJSON_AddNumberToObject(json, "weight_g", weight_g);
+    // Create string data from JSON
+    char *data = cJSON_PrintUnformatted(json);
+    // Send JSON to peer
+    esp_now_send(mac_address, (uint8_t*)data, strlen(data) + 1);
+    // Free data
+    cJSON_Delete(json);
 }
 
 
@@ -583,6 +645,45 @@ _Noreturn void read_from_pi_task() {
                         xTaskCreate(open_hatch_task, "open_hatch_task", 1028, NULL, 4, NULL);
                     }
                 }
+
+                const cJSON *calibration_array = NULL;
+                if (cJSON_HasObjectItem(json, "calibration")) {
+                    // Get the calibration item
+                    calibration_array = cJSON_GetObjectItem(json, "calibration");
+                    if (!cJSON_IsArray(calibration_array)) {
+                        ESP_LOGW(TAG, "calibration isn't an array!");
+                    } else {
+                        // Iterate through all calibration requests
+                        for (int i = 0; i < cJSON_GetArraySize(calibration_array); i++) {
+                            cJSON *calibration_request = cJSON_GetArrayItem(calibration_array, i);
+                            // Make sure this calibration request has the correct fields
+                            if (
+                                        cJSON_HasObjectItem(calibration_request, "shelf_id") &&
+                                            cJSON_HasObjectItem(calibration_request, "slot_id") &&
+                                            cJSON_HasObjectItem(calibration_request, "weight_g")
+                                    ) {
+                                // Extract all fields
+                                char *shelf_mac_raw = cJSON_GetStringValue(cJSON_GetObjectItem(calibration_request, "shelf_id"));
+                                int slot_id = (int)cJSON_GetNumberValue(cJSON_GetObjectItem(calibration_request, "slot_id"));
+                                double calibration_weight_g = cJSON_GetNumberValue(cJSON_GetObjectItem(calibration_request, "weight_g"));
+
+                                // Convert mac address
+                                uint8_t shelf_mac[6] = {0};
+                                err = parse_mac_str(shelf_mac_raw, shelf_mac);
+                                if (err != ESP_OK) {
+                                    ESP_LOGE(TAG, "Unable to convert string MAC to uint8_t array!");
+                                } else {
+                                    // TODO Send calibration values to other ESP32 using HIGHER priority than normal (new calibration should happen ASAP before more data is sent)
+                                    // task_send_calibration_to_shelf(shelf_mac, slot_id, calibration_weight_g);
+                                }
+                                heap_caps_free(shelf_mac);
+                            } else {
+                                ESP_LOGW(TAG, "Invalid calibration request");
+                            }
+                        }
+                    }
+                }
+
 free_json:
                 cJSON_Delete(json);
             }
@@ -607,36 +708,35 @@ void app_main(void)
     gpio_set_level(DOOR_CONTROL_PIN, 1);
     gpio_set_level(HATCH_CONTROL_PIN, 1);
 
-    nvs_flash_init();
 
+    // Initialize every component
+    nvs_flash_init();
     configure_pins();
     ESP_LOGD(TAG, "Initialized GPIO");
-
     init_wifi();
     ESP_LOGD(TAG, "Initialized wifi radio");
-
     fans_init();
     ESP_LOGD(TAG, "Initialized fans");
-
     init_uart();
     ESP_LOGD(TAG, "Initialized UART");
-
     init_leds();
     ESP_LOGD(TAG, "Initialized LEDs");
+    sm_init();
 
     // Schedule LEDs control task
     xTaskCreate(update_leds_task, "update_leds_task", 4096, NULL, 4, NULL);
-
 
     // Schedule UART read/write tasks
     xTaskCreate(read_from_pi_task, "read_from_pi_task", 4096, NULL, 4, NULL);
     xTaskCreate(send_status_to_pi_task, "send_status_to_pi_task", 4096, NULL, 4, NULL);
 
-    // ESP-NOW
+    // TODO create and schedule task for sending data to the Jetson
+    // TODO create and schedule task to monitor shelves as they disconnect
 
+    // ESP-NOW
+    // Creat queue, register message received ISR, and create processing task
     esp_now_q = xQueueCreate(50, sizeof(esp_now_msg_t));
     esp_now_register_recv_cb(esp_now_recv_cb);
     xTaskCreate(esp_now_task, "esp_now_task", 4096, NULL, 4, NULL);
-
 
 }

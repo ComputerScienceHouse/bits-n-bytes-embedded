@@ -12,7 +12,11 @@
 #include "esp_now.h"
 #include "cJSON.h"
 
+// Slots
 #define NUM_SLOTS 4
+
+// ESP-NOW buffer
+#define ESP_NOW_BUFFER_SIZE 300
 
 // Timing definition
 #define WEIGHT_UPDATE_DELAY_MS 250
@@ -30,21 +34,27 @@
 #define SLOT_3_UPPER_PIN 27
 #define SLOT_3_LOWER_PIN 4
 
+// Load cells as slots
 typedef struct {
     hx711_t *upper_load_cell;
     hx711_t *lower_load_cell;
 } slot_t ;
-
 slot_t *slots = NULL;
-
 
 // TODO remove atlas mac, this should not be hardcoded
 uint8_t atlas_mac[ESP_NOW_ETH_ALEN] = {0x30, 0xC6, 0xF7, 0x29, 0xE1, 0x90};
 
-
-
+// String to store this device's mac address
 static char mac_address_str[18];
 
+// ESP-NOW receive messages
+typedef struct message {
+    int32_t length;
+    char data[ESP_NOW_BUFFER_SIZE];
+} message_t;
+static QueueHandle_t esp_now_queue;
+
+// Logging tag
 static const char* TAG = "shelf";
 
 
@@ -182,6 +192,51 @@ void init_load_cells() {
     }
 }
 
+
+void esp_now_message_received_isr(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+    // Check if any data was received
+    if (!data || len <= 0) return;
+
+    message_t msg;
+
+    // Create a message object for the queue
+    if (len > sizeof(msg.data)) {
+        ESP_LOGW(TAG, "Received ESP-NOW message that is too long for the buffer!");
+        len = sizeof(msg.data);
+    }
+
+    memcpy(msg.data, data, len);
+    msg.length = len;
+
+    // Send to queue from ISR
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xQueueSendFromISR(esp_now_queue, &msg, &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+
+_Noreturn void process_esp_now_msg_task(void* pvParameters) {
+
+    message_t msg;
+
+    while (1) {
+
+        // Get next message from the queue
+        if (xQueueReceive(esp_now_queue, &msg, portMAX_DELAY)) {
+            cJSON *json = cJSON_Parse(msg.data);
+
+
+
+            // Free memory
+            cJSON_Delete(json);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+
 /**
  * Task to get the weights from the load cells and send them over ESP-NOW.
  * @param pvParameters parameters
@@ -247,6 +302,8 @@ void app_main(void)
     init_wifi();
     ESP_LOGD(TAG, "Initialized Wifi radio");
 
+
+
     esp_now_init();
     ESP_LOGD(TAG, "Initialized ESP-NOW");
 
@@ -267,6 +324,13 @@ void app_main(void)
         esp_now_add_peer(&en_peer_info);
     }
 
+    // Create ESP-NOW queue
+
+    // Register callback for when a message is received over MQTT
+    esp_now_queue = xQueueCreate(10, sizeof(message_t));
+    esp_now_register_recv_cb(esp_now_message_received_isr);
+
     xTaskCreate(send_weights_task, "send_weights_task", 2048, NULL, 4, NULL);
+
 
 }
