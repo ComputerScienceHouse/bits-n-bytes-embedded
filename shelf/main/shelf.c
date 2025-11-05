@@ -11,6 +11,7 @@
 #include "esp_log.h"
 #include "esp_now.h"
 #include "cJSON.h"
+#include "math.h"
 
 // Slots
 #define NUM_SLOTS 4
@@ -36,6 +37,9 @@
 
 // Load cells as slots
 typedef struct {
+    _Atomic double calibration_factor;
+    _Atomic double calibration_previous_raw;
+    _Atomic double current_raw;
     hx711_t *upper_load_cell;
     hx711_t *lower_load_cell;
 } slot_t ;
@@ -135,7 +139,7 @@ void store_mac_address() {
 void init_load_cells() {
 
     // Allocate memory for slots
-    slots = heap_caps_malloc(NUM_SLOTS * sizeof(slot_t), MALLOC_CAP_DEFAULT);
+    slots = malloc(NUM_SLOTS * sizeof(slot_t));
     if (slots == NULL) {
         ESP_LOGE(TAG, "Failed to allocate slots!");
         abort();
@@ -144,9 +148,10 @@ void init_load_cells() {
     memset(slots, 0, NUM_SLOTS * sizeof(slot_t));
 
     for (size_t i = 0; i < NUM_SLOTS; i++) {
+
         // Allocate memory for hx711s
-        slots[i].upper_load_cell = heap_caps_malloc(sizeof(hx711_t), MALLOC_CAP_DEFAULT);
-        slots[i].lower_load_cell = heap_caps_malloc(sizeof(hx711_t), MALLOC_CAP_DEFAULT);
+        slots[i].upper_load_cell = malloc(sizeof(hx711_t));
+        slots[i].lower_load_cell = malloc(sizeof(hx711_t));
 
         if (
                 slots[i].upper_load_cell == NULL ||
@@ -192,6 +197,41 @@ void init_load_cells() {
     }
 }
 
+void load_calibration() {
+
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to load calibration values from NVS");
+        abort();
+    }
+
+    for (size_t i = 0; i < NUM_SLOTS; i++) {
+
+        char storage_key[20];
+        sprintf(storage_key, "slot_%d_cal", i);
+        double calibration_value = 1.0;
+        size_t size = sizeof(calibration_value);
+        err = nvs_get_blob(nvs_handle, storage_key, &calibration_value, &size);
+        switch (err) {
+            case ESP_OK:
+                slots[i].calibration_factor = calibration_value;
+                break;
+            case ESP_ERR_NVS_NOT_FOUND:
+                slots[i].calibration_factor = calibration_value;
+                nvs_set_blob(nvs_handle, storage_key, &calibration_value, size);
+                nvs_commit(nvs_handle);
+                break;
+            default:
+                ESP_LOGE(TAG, "Error reading NVS values!");
+                nvs_close(nvs_handle);
+                abort();
+                break;
+        }
+    }
+    nvs_close(nvs_handle);
+}
+
 
 void esp_now_message_received_isr(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     // Check if any data was received
@@ -216,6 +256,24 @@ void esp_now_message_received_isr(const esp_now_recv_info_t *info, const uint8_t
     }
 }
 
+/**
+ * Calculate the conversion factor for a slot
+ * @param previous_val previous raw slot value
+ * @param current_val current raw slot value (with known weight change applied)
+ * @param tare_weight tare weight (known weight change)
+ * @param output pointer to output
+ * @return esp_err_T
+ */
+static esp_err_t calc_conversion_factor(double previous_val, double current_val, double tare_weight, double *output) {
+    if (previous_val == current_val) {
+        ESP_LOGW(TAG, "Loaded weight and zero weight are the same, can't compute conversion factor");
+        return ESP_ERR_INVALID_ARG;
+    } else {
+        *output = fabs(tare_weight / (current_val - previous_val));
+        return ESP_OK;
+    }
+}
+
 
 _Noreturn void process_esp_now_msg_task(void* pvParameters) {
 
@@ -227,8 +285,47 @@ _Noreturn void process_esp_now_msg_task(void* pvParameters) {
         if (xQueueReceive(esp_now_queue, &msg, portMAX_DELAY)) {
             cJSON *json = cJSON_Parse(msg.data);
 
+            if (cJSON_HasObjectItem(json, "slot_id") && cJSON_HasObjectItem(json, "weight_g")) {
+                cJSON *slot_id_item = cJSON_GetObjectItem(json, "slot_id");
+                cJSON *weight_g_item = cJSON_GetObjectItem(json, "weight_g");
 
+                if (cJSON_IsNumber(slot_id_item) && cJSON_IsNumber(weight_g_item)) {
+                    int slot_id = (int)cJSON_GetNumberValue(slot_id_item);
+                    double weight_g = cJSON_GetNumberValue(weight_g_item);
+                    if (slot_id < NUM_SLOTS) {
+                        double output = 1.0;
+                        esp_err_t err = calc_conversion_factor(slots[slot_id].calibration_previous_raw, slots[slot_id].current_raw, weight_g, &output);
+                        if (err == ESP_OK) {
+                            slots[slot_id].calibration_factor = output;
 
+                            // Write to NVS
+                            nvs_handle_t nvs_handle;
+                            err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
+                            if (err != ESP_OK) {
+                                ESP_LOGW(TAG, "Failed to open NVS to write new calibration value to NVS");
+                            } else {
+                                char storage_key[30];
+                                sprintf(storage_key, "slot_%d_cal", slot_id);
+                                size_t size = sizeof(output);
+                                err = nvs_set_blob(nvs_handle, storage_key, &output, size);
+                                if (err != ESP_OK) {
+                                    ESP_LOGW(TAG, "Failed to store new calibration value in NVS");
+                                }
+                                nvs_commit(nvs_handle);
+                            }
+                            nvs_close(nvs_handle);
+                        }
+                    } else {
+                        ESP_LOGW(TAG, "Received slot ID exceeding max number of slots on this shelf");
+                    }
+                } else {
+                    ESP_LOGW(TAG, "Received bad JSON packet over ESP-NOW.");
+                }
+                free(slot_id_item);
+                free(weight_g_item);
+            } else {
+                ESP_LOGW(TAG, "Received bad JSON packet over ESP-NOW.");
+            }
             // Free memory
             cJSON_Delete(json);
         }
@@ -270,6 +367,9 @@ _Noreturn void send_weights_task(void* pvParameters) {
                 ESP_LOGD(TAG, "Slot %d weight value: %0.5f", i, weight_value);
                 cJSON *weight_value_json = cJSON_CreateNumber(weight_value);
                 cJSON_AddItemToArray(shelves_array, weight_value_json);
+
+                slots[i].current_raw = weight_value;
+
             }
         }
 
@@ -295,15 +395,10 @@ void app_main(void)
 
     nvs_flash_init();
     ESP_LOGD(TAG, "Initialized NVS");
-
     configure_pins();
     ESP_LOGD(TAG, "Initialized GPIO");
-
     init_wifi();
     ESP_LOGD(TAG, "Initialized Wifi radio");
-
-
-
     esp_now_init();
     ESP_LOGD(TAG, "Initialized ESP-NOW");
 
@@ -311,6 +406,8 @@ void app_main(void)
 
     init_load_cells();
     ESP_LOGD(TAG, "Initialized load cells");
+
+    load_calibration();
 
 
     // Add ESP-NOW peer (Atlas)
@@ -331,6 +428,6 @@ void app_main(void)
     esp_now_register_recv_cb(esp_now_message_received_isr);
 
     xTaskCreate(send_weights_task, "send_weights_task", 2048, NULL, 4, NULL);
-
+    xTaskCreate(process_esp_now_msg_task, "process_esp_now_msg_task", 4096, NULL, 5, NULL);
 
 }

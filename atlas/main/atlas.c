@@ -533,8 +533,6 @@ _Noreturn void send_status_to_pi_task() {
         cJSON_AddNumberToObject(json, "exhaust_rpm", 1000);
         // Add connected shelves
 
-
-
         // TODO send connected shelf IDs to the pi
 
         // Send to Pi over uart
@@ -570,23 +568,32 @@ static esp_err_t parse_mac_str(const char*mac_str, uint8_t *mac_out) {
 }
 
 
+typedef struct {
+    int slot_id;
+    double weight_g;
+    uint8_t mac_address[MAC_ADDRESS_LENGTH];
+} shelf_calibration_data_t;
+
 /**
  * Send calibration data to a shelf.
  * @param mac_address The mac address of the shelf, as a 6 byte uint8_t
  * @param slot_id The ID of the slot to calibrate
  * @param weight_g The calibration value used
  */
-void task_send_calibration_to_shelf(uint8_t* mac_address, int slot_id, double weight_g) {
+void task_send_calibration_to_shelf(void* pvParameters) {
+    shelf_calibration_data_t *info = (shelf_calibration_data_t*)pvParameters;
     // Construct JSON
     cJSON *json = cJSON_CreateObject();
-    cJSON_AddNumberToObject(json, "shelf_id", slot_id);
-    cJSON_AddNumberToObject(json, "weight_g", weight_g);
+    cJSON_AddNumberToObject(json, "slot_id", info->slot_id);
+    cJSON_AddNumberToObject(json, "weight_g", info->weight_g);
     // Create string data from JSON
     char *data = cJSON_PrintUnformatted(json);
     // Send JSON to peer
-    esp_now_send(mac_address, (uint8_t*)data, strlen(data) + 1);
+    esp_now_send(info->mac_address, (uint8_t*)data, strlen(data) + 1);
     // Free data
     cJSON_Delete(json);
+    free(info);
+    vTaskDelete(NULL);
 }
 
 
@@ -668,13 +675,17 @@ _Noreturn void read_from_pi_task() {
                                 double calibration_weight_g = cJSON_GetNumberValue(cJSON_GetObjectItem(calibration_request, "weight_g"));
 
                                 // Convert mac address
-                                uint8_t shelf_mac[6] = {0};
+                                uint8_t *shelf_mac = malloc(sizeof(uint8_t) * MAC_ADDRESS_LENGTH);
                                 err = parse_mac_str(shelf_mac_raw, shelf_mac);
                                 if (err != ESP_OK) {
-                                    ESP_LOGE(TAG, "Unable to convert string MAC to uint8_t array!");
+                                    ESP_LOGE(TAG, "Unable to convert string MAC to uint8_t pointer");
                                 } else {
-                                    // TODO Send calibration values to other ESP32 using HIGHER priority than normal (new calibration should happen ASAP before more data is sent)
-                                    // task_send_calibration_to_shelf(shelf_mac, slot_id, calibration_weight_g);
+                                    // Send calibration data to the shelf
+                                    shelf_calibration_data_t* calibration_data = malloc(sizeof(shelf_calibration_data_t));
+                                    memcpy(calibration_data->mac_address, shelf_mac, MAC_ADDRESS_LENGTH);
+                                    calibration_data->weight_g = calibration_weight_g;
+                                    calibration_data->slot_id = slot_id;
+                                    xTaskCreate(task_send_calibration_to_shelf, "send_calibration_to_shelf", 4096, (void*)calibration_data, 6, NULL);
                                 }
                                 heap_caps_free(shelf_mac);
                             } else {
