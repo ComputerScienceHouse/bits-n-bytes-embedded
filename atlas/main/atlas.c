@@ -155,7 +155,7 @@ bool is_hatch_closed() {
 }
 
 /**
- * Callback ISR for when a messsage is received over ESP-NOW.
+ * Callback for when a message is received over ESP-NOW.
  * @param info
  * @param data
  * @param len
@@ -176,9 +176,7 @@ void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int l
     memcpy(msg.destination_mac, info->des_addr, MAC_ADDRESS_LENGTH);
 
     // Send to queue from ISR
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xQueueSendFromISR(esp_now_q, &msg, &xHigherPriorityTaskWoken);
-    if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
+    xQueueSend(esp_now_q, &msg, ESP_NOW_QUEUE_MAX_MS);
 }
 
 
