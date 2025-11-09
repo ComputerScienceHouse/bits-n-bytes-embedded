@@ -327,8 +327,8 @@ _Noreturn void process_esp_now_msg_task(void* pvParameters) {
                                     ESP_LOGW(TAG, "Failed to store new calibration value in NVS");
                                 }
                                 nvs_commit(nvs_handle);
+                                nvs_close(nvs_handle);
                             }
-                            nvs_close(nvs_handle);
                             slots[slot_id].calibration_previous_raw = current_raw;
                             ESP_LOGI(TAG, "Successfully tared");
                         }
@@ -389,14 +389,15 @@ _Noreturn void send_weights_task(void* pvParameters) {
                 }
                 cJSON_AddItemToArray(shelves_array, cJSON_CreateNull());
             } else {
-                double weight_value = (double)(upper + lower) / slots[i].calibration_factor;
-                if (i == 0) {
+                double raw_weight_total = (double)(upper + lower);
+                double weight_value = raw_weight_total * slots[i].calibration_factor;
+                if (i == 3) {
                     ESP_LOGD(TAG, "Slot %d weight value: %0.5f", i, weight_value);
                 }
                 cJSON *weight_value_json = cJSON_CreateNumber(weight_value);
                 cJSON_AddItemToArray(shelves_array, weight_value_json);
 
-                slots[i].current_raw = weight_value;
+                slots[i].current_raw = raw_weight_total;
 
             }
         }
