@@ -19,6 +19,15 @@ esp_err_t sm_update_shelf_time(uint8_t* mac_address, int64_t msg_recv_mu_s);
 
 
 /**
+ * Get the mac addresses of all active shelves.
+ * @param output allocated array of uint8_t*. Must be freed after use, along
+ * with all uint8_t pointers contained within.
+ * @return esp_err_t
+ */
+esp_err_t sm_get_all_active_shelves_mac_addresses(uint8_t*** output, size_t *num_shelves);
+
+
+/**
  * Check if a shelf is connected
  * @param mac_address
  * @return

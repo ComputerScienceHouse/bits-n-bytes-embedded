@@ -194,6 +194,9 @@ void init_load_cells() {
         slots[i].upper_load_cell->pd_sck = LC_CLOCK_PIN;
         slots[i].upper_load_cell->gain = HX711_GAIN_A_64;
         hx711_init(slots[i].upper_load_cell);
+
+        slots[i].calibration_previous_raw = 0;
+        slots[i].current_raw = 0;
     }
 }
 
@@ -269,7 +272,7 @@ static esp_err_t calc_conversion_factor(double previous_val, double current_val,
         ESP_LOGW(TAG, "Loaded weight and zero weight are the same, can't compute conversion factor");
         return ESP_ERR_INVALID_ARG;
     } else {
-        *output = fabs(tare_weight / (current_val - previous_val));
+        *output = (double)tare_weight / (current_val - previous_val);
         return ESP_OK;
     }
 }
@@ -285,19 +288,31 @@ _Noreturn void process_esp_now_msg_task(void* pvParameters) {
         if (xQueueReceive(esp_now_queue, &msg, portMAX_DELAY)) {
             cJSON *json = cJSON_Parse(msg.data);
 
+            // Make sure the slot_id and the weight_g exist
             if (cJSON_HasObjectItem(json, "slot_id") && cJSON_HasObjectItem(json, "weight_g")) {
+
+                // Get the objects
                 cJSON *slot_id_item = cJSON_GetObjectItem(json, "slot_id");
                 cJSON *weight_g_item = cJSON_GetObjectItem(json, "weight_g");
 
+                // Make sure they are numbers
                 if (cJSON_IsNumber(slot_id_item) && cJSON_IsNumber(weight_g_item)) {
+                    // Extract data
                     int slot_id = (int)cJSON_GetNumberValue(slot_id_item);
                     double weight_g = cJSON_GetNumberValue(weight_g_item);
+
+                    // Make sure the slot is valid
                     if (slot_id < NUM_SLOTS) {
                         double output = 1.0;
-                        esp_err_t err = calc_conversion_factor(slots[slot_id].calibration_previous_raw, slots[slot_id].current_raw, weight_g, &output);
+
+                        double current_raw = slots[slot_id].current_raw;
+
+                        // Calculate the conversion factor
+                        esp_err_t err = calc_conversion_factor(slots[slot_id].calibration_previous_raw, current_raw, weight_g, &output);
+
                         if (err == ESP_OK) {
                             slots[slot_id].calibration_factor = output;
-
+                            ESP_LOGI(TAG, "Set calibration factor to %.5f", output);
                             // Write to NVS
                             nvs_handle_t nvs_handle;
                             err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
@@ -314,17 +329,17 @@ _Noreturn void process_esp_now_msg_task(void* pvParameters) {
                                 nvs_commit(nvs_handle);
                             }
                             nvs_close(nvs_handle);
+                            slots[slot_id].calibration_previous_raw = current_raw;
+                            ESP_LOGI(TAG, "Successfully tared");
                         }
                     } else {
                         ESP_LOGW(TAG, "Received slot ID exceeding max number of slots on this shelf");
                     }
                 } else {
-                    ESP_LOGW(TAG, "Received bad JSON packet over ESP-NOW.");
+                    ESP_LOGW(TAG, "Received bad JSON packet over ESP-NOW: %s", msg.data);
                 }
-                free(slot_id_item);
-                free(weight_g_item);
             } else {
-                ESP_LOGW(TAG, "Received bad JSON packet over ESP-NOW.");
+                ESP_LOGW(TAG, "Calibration packet received without slot_id or weight_g fields");
             }
             // Free memory
             cJSON_Delete(json);
@@ -345,7 +360,18 @@ _Noreturn void send_weights_task(void* pvParameters) {
 
         // Create JSON
         cJSON *json = cJSON_CreateObject();
+        if (json == NULL) {
+            ESP_LOGE(TAG, "Failed to create JSON object");
+            vTaskDelay(pdMS_TO_TICKS(WEIGHT_UPDATE_DELAY_MS));
+            continue;
+        }
         cJSON *shelves_array = cJSON_AddArrayToObject(json, "slots");
+        if (shelves_array == NULL) {
+            ESP_LOGE(TAG, "Failed to create JSON array");
+            cJSON_Delete(json);
+            vTaskDelay(pdMS_TO_TICKS(WEIGHT_UPDATE_DELAY_MS));
+            continue;
+        }
 
         // Read load cell data for each slot
         for (size_t i = 0; i < NUM_SLOTS; i++) {
@@ -363,8 +389,10 @@ _Noreturn void send_weights_task(void* pvParameters) {
                 }
                 cJSON_AddItemToArray(shelves_array, cJSON_CreateNull());
             } else {
-                double weight_value = (double)(upper + lower);
-                ESP_LOGD(TAG, "Slot %d weight value: %0.5f", i, weight_value);
+                double weight_value = (double)(upper + lower) / slots[i].calibration_factor;
+                if (i == 0) {
+                    ESP_LOGD(TAG, "Slot %d weight value: %0.5f", i, weight_value);
+                }
                 cJSON *weight_value_json = cJSON_CreateNumber(weight_value);
                 cJSON_AddItemToArray(shelves_array, weight_value_json);
 
@@ -375,10 +403,14 @@ _Noreturn void send_weights_task(void* pvParameters) {
 
         // Send JSON data to Atlas ESP32
         char *json_string = cJSON_PrintUnformatted(json);
-        esp_now_send(atlas_mac, (uint8_t*)json_string, strlen(json_string));
+        if (json_string != NULL) {
+            size_t json_len = strlen(json_string);
+            esp_now_send(atlas_mac, (uint8_t*)json_string, json_len);
+            free(json_string);
+        } else {
+            ESP_LOGE(TAG, "Failed to serialize JSON. Free heap: %lu", esp_get_free_heap_size());
+        }
 
-        // Free all memory
-        free(json_string);
         cJSON_Delete(json);
 
         vTaskDelay(pdMS_TO_TICKS(WEIGHT_UPDATE_DELAY_MS));
@@ -428,6 +460,6 @@ void app_main(void)
     esp_now_register_recv_cb(esp_now_message_received_isr);
 
     xTaskCreate(send_weights_task, "send_weights_task", 2048, NULL, 4, NULL);
-    xTaskCreate(process_esp_now_msg_task, "process_esp_now_msg_task", 4096, NULL, 5, NULL);
+    xTaskCreate(process_esp_now_msg_task, "process_esp_now_msg_task", 16384, NULL, 5, NULL);
 
 }

@@ -137,6 +137,50 @@ bool sm_is_shelf_connected(uint8_t* mac_address) {
     return false;
 }
 
+/**
+ * Get the mac addresses of all active shelves.
+ * @param output allocated array of uint8_t*. Must be freed after use, along
+ * with all uint8_t pointers contained within.
+ * @return esp_err_t
+ */
+esp_err_t sm_get_all_active_shelves_mac_addresses(uint8_t*** output, size_t *num_shelves) {
+
+    if (xSemaphoreTake(active_shelves_mutex, MAX_MUTEX_DELAY_TICKS)) {
+
+        if (num_active_shelves == 0) {
+            *num_shelves = 0;
+            xSemaphoreGive(active_shelves_mutex);
+            return ESP_OK;
+        }
+
+        *output = malloc(num_active_shelves * sizeof(uint8_t*));
+
+        if (*output == NULL) {
+            xSemaphoreGive(active_shelves_mutex);
+            return ESP_ERR_NO_MEM;
+        }
+
+        for (size_t i = 0; i < num_active_shelves; i++) {
+            (*output)[i] = malloc(MAC_ADDRESS_LENGTH);
+            if ((*output)[i] == NULL) {
+                // Clean up on failure
+                for (size_t j = 0; j < i; j++) {
+                    free((*output)[j]);
+                }
+                free(*output);
+                xSemaphoreGive(active_shelves_mutex);
+                return ESP_ERR_NO_MEM;
+            }
+            memcpy((*output)[i], active_shelves[i]->mac_address, MAC_ADDRESS_LENGTH);
+        }
+        *num_shelves = num_active_shelves;
+        xSemaphoreGive(active_shelves_mutex);
+        return ESP_OK;
+    } else {
+        return ESP_ERR_TIMEOUT;
+    }
+}
+
 
 /**
  * Remove a shelf. NOTE: This is ONLY to be used internally by this library, as
