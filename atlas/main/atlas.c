@@ -421,6 +421,19 @@ void init_leds() {
 }
 
 
+static float fade_mix = 0.0f;  // 0 = white, 1 = effect
+
+void fade_mix_toward(float target, float step) {
+    if (fade_mix < target) {
+        fade_mix += step;
+        if (fade_mix > target) fade_mix = target;
+    } else if (fade_mix > target) {
+        fade_mix -= step;
+        if (fade_mix < target) fade_mix = target;
+    }
+}
+
+
 /**
  * Convert HSV to RGB.
  * @param h float hue
@@ -465,7 +478,11 @@ float leds_rainbow_chase(float hue_offset) {
         uint8_t r, g, b;
         float hue = fmodf(hue_offset + (360.0f * i / NUM_LEDS), 360.0f);
         hsv_to_rgb(hue, 1.0f, 1.0f, &r, &g, &b);
-        err = led_strip_set_pixel(led_strip, i, r, g, b);
+        uint8_t rw = 255, gw = 255, bw = 255;
+        uint8_t rf = (uint8_t)(fade_mix * r + (1.0f - fade_mix) * rw);
+        uint8_t gf = (uint8_t)(fade_mix * g + (1.0f - fade_mix) * gw);
+        uint8_t bf = (uint8_t)(fade_mix * b + (1.0f - fade_mix) * bw);
+        err = led_strip_set_pixel(led_strip, i, rf, gf, bf);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Unable to set pixel %d of LED", i);
         }
@@ -498,10 +515,18 @@ float leds_bnb_color_chase(float phase) {
 
         if (block_index % 2 == 0) {
             // Orange block
-            err = led_strip_set_pixel(led_strip, i, 250, 25, 0);
+            uint8_t rw = 255, gw = 255, bw = 255;
+            uint8_t rf = (uint8_t)(fade_mix * 250 + (1.0f - fade_mix) * rw);
+            uint8_t gf = (uint8_t)(fade_mix * 25 + (1.0f - fade_mix) * gw);
+            uint8_t bf = (uint8_t)(fade_mix * 0 + (1.0f - fade_mix) * bw);
+            err = led_strip_set_pixel(led_strip, i, rf, gf, bf);
         } else {
             // Purple block
-            err = led_strip_set_pixel(led_strip, i, 130, 0, 250);
+            uint8_t rw = 255, gw = 255, bw = 255;
+            uint8_t rf = (uint8_t)(fade_mix * 130 + (1.0f - fade_mix) * rw);
+            uint8_t gf = (uint8_t)(fade_mix * 0 + (1.0f - fade_mix) * gw);
+            uint8_t bf = (uint8_t)(fade_mix * 250 + (1.0f - fade_mix) * bw);
+            err = led_strip_set_pixel(led_strip, i, rf, gf, bf);
         }
 
         if (err != ESP_OK) {
@@ -523,7 +548,11 @@ float leds_rainbow_gradient(float hue) {
     hue = fmodf(hue + 2.0f, 360.0f);
     for (int i = 0; i < NUM_LEDS; i++) {
         hsv_to_rgb(hue, 1.0f, 1.0f, &r, &g, &b);
-        led_strip_set_pixel(led_strip, i, r, g, b);
+        uint8_t rw = 255, gw = 255, bw = 255;
+        uint8_t rf = (uint8_t)(fade_mix * r + (1.0f - fade_mix) * rw);
+        uint8_t gf = (uint8_t)(fade_mix * g + (1.0f - fade_mix) * gw);
+        uint8_t bf = (uint8_t)(fade_mix * b + (1.0f - fade_mix) * bw);
+        err = led_strip_set_pixel(led_strip, i, rf, gf, bf);
     }
     err = led_strip_refresh(led_strip);
     if (err != ESP_OK) {
@@ -553,30 +582,30 @@ _Noreturn void update_leds_task() {
     int64_t effect_last_changed = 0;
 
     while(1) {
-        if (are_doors_closed()) {
-            // Attract mode: Do cool effects
 
-            // Check if it's time to switch effects
-            int64_t current_time_ms = esp_timer_get_time() / 1000;
-            if (current_time_ms - effect_last_changed > effect_switch_ms) {
-                // Switch effects
-                current_effect = (current_effect + 1) % (sizeof(effects) / sizeof(effects[0]));
-                effect_last_changed = current_time_ms;
-                fx_val_store = 0.0f;
-            }
+        bool doors_closed = are_doors_closed();
 
-            // Update LEDs based on current effect
-            fx_val_store = effects[current_effect](fx_val_store);
-
+        float target_mix = 0.0f;
+        if (doors_closed) {
+            target_mix = 1.0f;
+            fade_mix_toward(target_mix, 0.05f);
         } else {
-            for (size_t i = 0; i < NUM_LEDS; i++) {
-                led_strip_set_pixel(led_strip, i, 255, 255, 255);
-            }
-            led_strip_refresh(led_strip);
-            // Task can be delayed longer, LED updates are not important
-            // (they stay the same while the doors are open).
-            vTaskDelay(pdMS_TO_TICKS(100));
+            target_mix = 0.0f;
+            fade_mix_toward(target_mix, 0.1f);
+
         }
+
+        int64_t current_time_ms = esp_timer_get_time() / 1000;
+        if (current_time_ms - effect_last_changed > effect_switch_ms) {
+            current_effect = (current_effect + 1) % (sizeof(effects) / sizeof(effects[0]));
+            effect_last_changed = current_time_ms;
+            fx_val_store = 0.0f;
+        }
+
+        // Always render the effect — blend handles showing more or less white
+        fx_val_store = effects[current_effect](fx_val_store);
+
+        vTaskDelay(pdMS_TO_TICKS(20));  // smooth update
     }
 }
 
