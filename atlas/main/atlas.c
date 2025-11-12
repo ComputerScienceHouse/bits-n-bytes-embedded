@@ -882,8 +882,11 @@ _Noreturn void send_to_jetson_task() {
 
                 // Write data to Jetson UART
                 char* data = cJSON_PrintUnformatted(json);
-                ESP_LOGI(TAG, "Writing to jetson!!");
+
+
                 uart_write_bytes(JETSON_UART_PORT_NUM, data, strlen(data));
+                char *terminator = "\n";
+                uart_write_bytes(JETSON_UART_PORT_NUM, terminator, 1);
 
                 // Free all memory
                 free(data);
