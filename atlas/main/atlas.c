@@ -25,6 +25,7 @@
 #include "cJSON.h"
 #include "fans.h"
 #include "shelf_manager.h"
+#include <esp_mac.h>
 
 // Pins
 #define INTERNAL_LED_PIN 2
@@ -47,10 +48,10 @@
 #define PI_UART_BAUD_RATE 9600
 static const int pi_uart_rx_buffer_size = 1024;
 static const int pi_uart_tx_buffer_size = 1024;
-#define JETSON_UART_PORT_NUM 3
+#define JETSON_UART_PORT_NUM 1
 #define JETSON_UART_BAUD_RATE 115200
-//static const int jetson_uart_rx_buffer_size = 1024;
-//static const int jetson_uart_tx_buffer_size = 1024;
+static const int jetson_uart_rx_buffer_size = 1024;
+static const int jetson_uart_tx_buffer_size = 1024;
 
 #define ESP_NOW_QUEUE_MAX_MS 500
 
@@ -70,6 +71,8 @@ static const int pi_uart_tx_buffer_size = 1024;
 // Tag for log messages
 static const char* TAG = "atlas";
 
+uint8_t mac_address[MAC_ADDRESS_LENGTH];
+
 // Handle for cabinet LED strip
 led_strip_handle_t led_strip = NULL;
 
@@ -83,6 +86,13 @@ typedef struct {
     uint8_t destination_mac[MAC_ADDRESS_LENGTH];
     uint8_t data[250];
 } esp_now_msg_t;
+
+// Jetson
+static QueueHandle_t jetson_q;
+typedef struct {
+    size_t num_slots;
+    double **weight_values;
+} jetson_msg_t;
 
 
 /**
@@ -181,7 +191,7 @@ void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int l
     memcpy(msg.sender_mac, info->src_addr, MAC_ADDRESS_LENGTH);
     memcpy(msg.destination_mac, info->des_addr, MAC_ADDRESS_LENGTH);
 
-    // Send to queue from ISR
+    // Send to queue
     xQueueSend(esp_now_q, &msg, ESP_NOW_QUEUE_MAX_MS);
 }
 
@@ -195,6 +205,8 @@ _Noreturn void esp_now_task(void *pvParameter) {
 
     esp_now_msg_t msg;
 
+    const char* func_tag = "esp_now_task";
+
     while (true) {
 
         if (xQueueReceive(esp_now_q, &msg, portMAX_DELAY)) {
@@ -202,43 +214,74 @@ _Noreturn void esp_now_task(void *pvParameter) {
             // Make sure slots field exists
             cJSON *json = cJSON_Parse((char*)msg.data);
             if (!cJSON_HasObjectItem(json, "slots")) {
-                ESP_LOGW(TAG, "Received ESP-NOW msg with no slots field");
+                ESP_LOGW(func_tag, "Received ESP-NOW msg with no slots field");
                 goto free_json;
             }
 
             // Iterate through each slot
             cJSON *slot_array = cJSON_GetObjectItem(json, "slots");
             int num_slots = cJSON_GetArraySize(slot_array);
+
+            if (num_slots == 0) {
+                ESP_LOGE(func_tag, "Undefined behavior: zero slots!");
+                goto free_json;
+            }
+
+            double** weight_values = malloc(sizeof(double*) * num_slots);
+
             for (int i = 0; i < num_slots; i++) {
+                weight_values[i] = NULL;
                 // Try to convert item to number
                 cJSON *item = cJSON_GetArrayItem(slot_array, i);
                 if (cJSON_IsNull(item)) {
-                    ESP_LOGW(TAG, "Received null value for slot %d of shelf %s", i, "INSERT_MAC_HERE");
+                    ESP_LOGW(func_tag, "Received null value for slot %d of shelf %s", i, "INSERT_MAC_HERE");
                 } else if (!cJSON_IsNumber(item)) {
-                    ESP_LOGW(TAG, "Received non-numeric slot value");
+                    ESP_LOGW(func_tag, "Received non-numeric slot value");
                 } else {
                     double value = cJSON_GetNumberValue(item);
-//                    ESP_LOGD("ESP_VAL", "Slot: %d, value: %f", i, value);
                     // TODO use slot weight value (process it or add it to a queue to send to the Jetson)
-                }
-                // Update shelf manager with this shelf
-                if (!sm_is_shelf_connected(msg.sender_mac)) {
-                    sm_add_shelf(msg.sender_mac, msg.recv_time);
-
-                    // Add ESP-NOW peer (Atlas)
-                    esp_now_peer_info_t en_peer_info = {
-                            .channel = 0,
-                            .ifidx = ESP_IF_WIFI_STA,
-                            .encrypt = false
-                    };
-                    memcpy(en_peer_info.peer_addr, msg.sender_mac, ESP_NOW_ETH_ALEN);
-                    if (!esp_now_is_peer_exist(msg.sender_mac)) {
-                        esp_now_add_peer(&en_peer_info);
+                    double* weight = malloc(sizeof(double));
+                    if (weight == NULL) {
+                        ESP_LOGE(func_tag, "Failed to allocate memory for sending slot weight to jetson");
+                    } else {
+                        weight_values[i] = weight;
+                        *weight = value;
                     }
+                }
+            }
+
+            // Only send message to the Jetson if the doors are closed
+            if (!are_doors_closed()) {
+                jetson_msg_t jetson_msg;
+                jetson_msg.num_slots = num_slots;
+                jetson_msg.weight_values = weight_values;
+
+
+                if (xQueueSend(jetson_q, &jetson_msg, pdMS_TO_TICKS(10))) {
 
                 } else {
-                    sm_update_shelf_time(msg.sender_mac, msg.recv_time);
+                    ESP_LOGW(func_tag, "Unable to add message to jetson queue. Is it full?");
                 }
+            }
+
+
+            // Update shelf manager with this shelf
+            if (!sm_is_shelf_connected(msg.sender_mac)) {
+                sm_add_shelf(msg.sender_mac, msg.recv_time);
+
+                // Add ESP-NOW peer (Atlas)
+                esp_now_peer_info_t en_peer_info = {
+                        .channel = 0,
+                        .ifidx = ESP_IF_WIFI_STA,
+                        .encrypt = false
+                };
+                memcpy(en_peer_info.peer_addr, msg.sender_mac, ESP_NOW_ETH_ALEN);
+                if (!esp_now_is_peer_exist(msg.sender_mac)) {
+                    esp_now_add_peer(&en_peer_info);
+                }
+
+            } else {
+                sm_update_shelf_time(msg.sender_mac, msg.recv_time);
             }
             free_json:
             cJSON_Delete(json);
@@ -312,7 +355,11 @@ void init_wifi () {
     err = esp_now_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start ESP-NOW");
-
+    }
+    err = esp_read_mac(mac_address, ESP_MAC_WIFI_STA);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read device mac address!");
+        abort();
     }
 }
 
@@ -335,19 +382,19 @@ void init_uart() {
     ESP_ERROR_CHECK(uart_param_config(pi_uart_num, &pi_uart_cfg));
     ESP_ERROR_CHECK(uart_set_pin(PI_UART_PORT_NUM, PI_UART_TX_PIN, PI_UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-//    // Configure UART for the Jetson
-//    ESP_ERROR_CHECK(uart_driver_install(JETSON_UART_PORT_NUM, jetson_uart_rx_buffer_size, jetson_uart_tx_buffer_size, 0, NULL, 0));
-//    const uart_port_t jetson_uart_num = JETSON_UART_PORT_NUM;
-//    uart_config_t jetson_uart_cfg = {
-//            .baud_rate = JETSON_UART_BAUD_RATE,
-//            .data_bits = UART_DATA_8_BITS,
-//            .parity = UART_PARITY_DISABLE,
-//            .stop_bits = UART_STOP_BITS_1,
-//            .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-//            .rx_flow_ctrl_thresh = 122
-//    };
-//    ESP_ERROR_CHECK(uart_param_config(jetson_uart_num, &jetson_uart_cfg));
-//    ESP_ERROR_CHECK(uart_set_pin(JETSON_UART_PORT_NUM, JETSON_UART_TX_PIN, JETSON_UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    // Configure UART for the Jetson
+    ESP_ERROR_CHECK(uart_driver_install(JETSON_UART_PORT_NUM, jetson_uart_rx_buffer_size, jetson_uart_tx_buffer_size, 0, NULL, 0));
+    const uart_port_t jetson_uart_num = JETSON_UART_PORT_NUM;
+    uart_config_t jetson_uart_cfg = {
+            .baud_rate = JETSON_UART_BAUD_RATE,
+            .data_bits = UART_DATA_8_BITS,
+            .parity = UART_PARITY_DISABLE,
+            .stop_bits = UART_STOP_BITS_1,
+            .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+            .rx_flow_ctrl_thresh = 122
+    };
+    ESP_ERROR_CHECK(uart_param_config(jetson_uart_num, &jetson_uart_cfg));
+    ESP_ERROR_CHECK(uart_set_pin(JETSON_UART_PORT_NUM, JETSON_UART_TX_PIN, JETSON_UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 }
 
 
@@ -721,7 +768,7 @@ _Noreturn void read_from_pi_task() {
                 } else {
                     if (doors_item->valueint == 1) {
                         // Schedule call to open doors
-                        xTaskCreate(open_doors_task, "open_doors_task", 1028, NULL, 4, NULL);
+                        xTaskCreate(open_doors_task, "open_doors_task", 2048, NULL, 4, NULL);
                     }
                 }
 
@@ -731,7 +778,7 @@ _Noreturn void read_from_pi_task() {
                 } else {
                     if (hatch_item->valueint == 1) {
                         // Schedule call to open hatch
-                        xTaskCreate(open_hatch_task, "open_hatch_task", 1028, NULL, 4, NULL);
+                        xTaskCreate(open_hatch_task, "open_hatch_task", 2048, NULL, 4, NULL);
                     }
                 }
 
@@ -793,20 +840,59 @@ free_json:
     }
 }
 
-///**
-// *
-// */
-//_Noreturn void send_to_jetson_task() {
-//
-//
-//    while (1) {
-//        // Don't send data if the doors are closed
-//        if (are_doors_closed()) {
-//
-//        }
-//        vTaskDelay(pdMS_TO_TICKS(20));
-//    }
-//}
+/**
+ *
+ */
+_Noreturn void send_to_jetson_task() {
+
+    jetson_msg_t msg;
+
+    while (1) {
+
+        if (xQueueReceive(jetson_q, &msg, pdMS_TO_TICKS(10))) {
+
+            // Don't send data if the doors are closed
+            if (!are_doors_closed()) {
+                // Create JSON
+                cJSON* json = cJSON_CreateObject();
+
+                // Get mac address
+                char mac_address_str[20];
+                esp_err_t err = mac_to_str(mac_address, mac_address_str);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "Unable to convert mac address to string");
+                }
+                cJSON_AddStringToObject(json, "mac_address", mac_address_str);
+                cJSON* weights_array_obj = cJSON_AddArrayToObject(json, "slot_weights_g");
+
+                // Get all the weight values and add them to the JSON
+                for (size_t i = 0; i < msg.num_slots; i++) {
+                    // Get weight
+                    if (msg.weight_values[i]) {
+                        double weight_value = *msg.weight_values[i];
+                        // Add weight to JSON
+                        cJSON* weight_obj = cJSON_CreateNumber(weight_value);
+                        cJSON_AddItemToArray(weights_array_obj, weight_obj);
+                        // Free space taken by weight
+                        free(msg.weight_values[i]);
+                    }
+                }
+                // Free all other space taken by input
+                free(msg.weight_values);
+
+                // Write data to Jetson UART
+                char* data = cJSON_PrintUnformatted(json);
+                ESP_LOGI(TAG, "Writing to jetson!!");
+                uart_write_bytes(JETSON_UART_PORT_NUM, data, strlen(data));
+
+                // Free all memory
+                free(data);
+                cJSON_Delete(json);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
 
 
 
@@ -845,8 +931,8 @@ void app_main(void)
     xTaskCreate(read_from_pi_task, "read_from_pi_task", 4096, NULL, 4, NULL);
     xTaskCreate(send_status_to_pi_task, "send_status_to_pi_task", 4096, NULL, 4, NULL);
 
-    // TODO create and schedule task for sending data to the Jetson
-    // TODO create and schedule task to monitor shelves as they disconnect
+    jetson_q = xQueueCreate(50, sizeof(jetson_msg_t));
+    xTaskCreate(send_to_jetson_task, "send_to_jetson_task", 8192, NULL, 5, NULL);
 
     // ESP-NOW
     // Creat queue, register message received ISR, and create processing task
