@@ -25,13 +25,13 @@
 #define LOAD_CELL_READ_TIMEOUT_MS 125
 
 // Load cell polling and filtering
-#define POLLING_RATE_HZ 1000
+#define POLLING_RATE_HZ 500
 #define MEDIAN_FILTER_SIZE 5
 #define ROLLING_AVERAGE_FILTER_SIZE 5
 // Calculated, DO NOT MODIFY:
 #define POLLING_DELAY_MS (1000 / POLLING_RATE_HZ)
 #define STABLE_THRESHOLD 3
-#define STABLE_DURATION_MS 1
+#define STABLE_DURATION_MS 500
 
 // Pin definitions
 #define LED_PIN 2
@@ -424,14 +424,14 @@ static bool is_stable[NUM_SLOTS] = {false};
  * @param pvParameters
  * @return
  */
-_Noreturn void poll_weights_task(void *pvParameters) {
+void poll_weights_task(void *pvParameters) {
 
     const char* func_tag = "poll_weights_task";
 
     while (1) {
 
         for (size_t slot_i = 0; slot_i < NUM_SLOTS; slot_i++) {
-            int64_t time = esp_timer_get_time();
+            int64_t time = esp_timer_get_time() / 1000;
             int32_t upper, lower;
             bool lower_ok = read_load_cell_data(slots[slot_i].lower_load_cell, &lower) == ESP_OK;
             bool upper_ok = read_load_cell_data(slots[slot_i].upper_load_cell, &upper) == ESP_OK;
@@ -446,6 +446,7 @@ _Noreturn void poll_weights_task(void *pvParameters) {
             } else {
                 // Calculate weight in grams using calibration factor
                 double raw_weight_total = (double)(upper + lower);
+                slots[slot_i].current_raw = raw_weight_total;
                 double weight_grams = raw_weight_total * slots[slot_i].calibration_factor;
 
                 // Put weight into median window
@@ -592,5 +593,5 @@ void app_main(void)
 
     xTaskCreate(send_weights_task, "send_weights_task", 4096, NULL, 4, NULL);
     xTaskCreate(process_esp_now_msg_task, "process_esp_now_msg_task", 16384, NULL, 5, NULL);
-    xTaskCreate(poll_weights_task, "poll_weights_task", 2048, NULL, 5, NULL);
+    xTaskCreate(poll_weights_task, "poll_weights_task", 8192, NULL, 5, NULL);
 }

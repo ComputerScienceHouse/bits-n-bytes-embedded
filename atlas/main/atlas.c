@@ -223,7 +223,7 @@ _Noreturn void esp_now_task(void *pvParameter) {
 
                 if (!cJSON_IsNumber(slot_id_obj)) {
                     ESP_LOGE(func_tag, "slot_id value is not a number");
-                } else if (cJSON_IsNumber(delta_g_obj)) {
+                } else if (!cJSON_IsNumber(delta_g_obj)) {
                     ESP_LOGE(func_tag, "delta_g value is not a number");
                 } else {
                     jetson_msg_t jetson_msg;
