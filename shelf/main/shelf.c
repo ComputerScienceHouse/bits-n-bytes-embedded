@@ -21,7 +21,7 @@
 #define ESP_NOW_BUFFER_SIZE 300
 
 // Timing definition
-#define WEIGHT_UPDATE_DELAY_MS 250
+#define SHELF_COMM_MINIMUM_TIME 250
 #define LOAD_CELL_READ_TIMEOUT_MS 125
 
 // Load cell polling and filtering
@@ -517,33 +517,33 @@ _Noreturn void send_weights_task(void* pvParameters) {
 
     while (1) {
 
-        if (xQueueReceive(delta_msg_queue, &msg, 0)) {
-
-            // Create JSON
-            cJSON* json = cJSON_CreateObject();
-            if (json == NULL) {
-                ESP_LOGE(TAG, "Failed to create JSON object");
-                vTaskDelay(pdMS_TO_TICKS(WEIGHT_UPDATE_DELAY_MS));
-                continue;
-            }
-            cJSON_AddNumberToObject(json, "slot_id", msg.slot_id);
-            cJSON_AddNumberToObject(json, "delta_g", msg.delta);
-
-            // Send JSON data to Atlas ESP32
-            char *json_string = cJSON_PrintUnformatted(json);
-            if (json_string != NULL) {
-                size_t json_len = strlen(json_string);
-                esp_now_send(atlas_mac, (uint8_t *) json_string, json_len);
-                ESP_LOGI(TAG, "sent esp-now");
-                free(json_string);
-            } else {
-                ESP_LOGE(TAG, "Failed to serialize JSON. Free heap: %lu", esp_get_free_heap_size());
-            }
-
-            cJSON_Delete(json);
+        // Create JSON
+        cJSON* json = cJSON_CreateObject();
+        if (json == NULL) {
+            ESP_LOGE(TAG, "Failed to create JSON object");
+            vTaskDelay(pdMS_TO_TICKS(SHELF_COMM_MINIMUM_TIME));
+            continue;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(WEIGHT_UPDATE_DELAY_MS));
+        // If there is shelf data, get it, or wait max delay amount
+        if (xQueueReceive(delta_msg_queue, &msg, pdMS_TO_TICKS(SHELF_COMM_MINIMUM_TIME - 10))) {
+            cJSON_AddNumberToObject(json, "slot_id", msg.slot_id);
+            cJSON_AddNumberToObject(json, "delta_g", msg.delta);
+        }
+
+        // Send JSON data to Atlas ESP32
+        char *json_string = cJSON_PrintUnformatted(json);
+        if (json_string != NULL) {
+            size_t json_len = strlen(json_string);
+            esp_now_send(atlas_mac, (uint8_t *) json_string, json_len);
+            free(json_string);
+        } else {
+            ESP_LOGE(TAG, "Failed to serialize JSON. Free heap: %lu", esp_get_free_heap_size());
+        }
+
+        cJSON_Delete(json);
+
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 
 }
