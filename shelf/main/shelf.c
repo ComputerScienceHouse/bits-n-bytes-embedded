@@ -12,6 +12,7 @@
 #include "esp_now.h"
 #include "cJSON.h"
 #include "math.h"
+#include "esp_timer.h"
 
 // Slots
 #define NUM_SLOTS 4
@@ -22,6 +23,15 @@
 // Timing definition
 #define WEIGHT_UPDATE_DELAY_MS 250
 #define LOAD_CELL_READ_TIMEOUT_MS 125
+
+// Load cell polling and filtering
+#define POLLING_RATE_HZ 1000
+#define MEDIAN_FILTER_SIZE 5
+#define ROLLING_AVERAGE_FILTER_SIZE 5
+// Calculated, DO NOT MODIFY:
+#define POLLING_DELAY_MS (1000 / POLLING_RATE_HZ)
+#define STABLE_THRESHOLD 3
+#define STABLE_DURATION_MS 1
 
 // Pin definitions
 #define LED_PIN 2
@@ -57,6 +67,13 @@ typedef struct message {
     char data[ESP_NOW_BUFFER_SIZE];
 } message_t;
 static QueueHandle_t esp_now_queue;
+
+// Weight deltas sending
+typedef struct {
+    size_t slot_id;
+    double delta;
+} delta_msg_t;
+static QueueHandle_t delta_msg_queue;
 
 // Logging tag
 static const char* TAG = "shelf";
@@ -348,71 +365,183 @@ _Noreturn void process_esp_now_msg_task(void* pvParameters) {
     }
 }
 
+/**
+ * Get the median weight given a list of weight values using bubble sort.
+ * @param vals double pointer (which is an array of length MEDIAN_FILTER_SIZE)
+ * @return double median weight
+ */
+static double get_median_weight(const double *vals) {
+    double temp[MEDIAN_FILTER_SIZE];
+    memcpy(temp, vals, sizeof(temp));
+
+    // Bubble sort
+    for (int i = 0; i < MEDIAN_FILTER_SIZE; i++) {
+        for (int j = i + 1; j < MEDIAN_FILTER_SIZE; j++) {
+            if (temp[j] < temp[i]) {
+                double t = temp[i];
+                temp[i] = temp[j];
+                temp[j] = t;
+            }
+        }
+    }
+    // Return median
+    if (MEDIAN_FILTER_SIZE % 2 == 0) {
+        // Even number of values, calculate average of two medians
+        return (temp[(MEDIAN_FILTER_SIZE / 2) - 1] + temp[MEDIAN_FILTER_SIZE / 2]) / 2.0;
+    } else {
+        // Odd number of values, just return median
+        return temp[MEDIAN_FILTER_SIZE / 2];
+    }
+}
 
 /**
- * Task to get the weights from the load cells and send them over ESP-NOW.
+ * Get the average weight from the averaging filter.
+ * @param vals double pointer (which is an array of length ROLLING_AVERAGE_FILTER_SIZE)
+ * @return double average weight
+ */
+static double get_average_weight(const double *vals) {
+    double sum = 0.0;
+    for (size_t i = 0; i < ROLLING_AVERAGE_FILTER_SIZE; i++) {
+        sum = sum + vals[i];
+    }
+    return sum / (double)ROLLING_AVERAGE_FILTER_SIZE;
+}
+
+static double median_window[NUM_SLOTS][MEDIAN_FILTER_SIZE] = {0};
+static double average_window[NUM_SLOTS][ROLLING_AVERAGE_FILTER_SIZE] = {0};
+static size_t median_index[NUM_SLOTS] = {0};
+static size_t average_index[NUM_SLOTS] = {0};
+
+static int64_t last_value_time[NUM_SLOTS] = {0};
+static double last_stable_weight[NUM_SLOTS] = {0};
+static double last_average_value[NUM_SLOTS] = {0};
+static uint32_t stable_timer[NUM_SLOTS] = {0};
+static bool is_stable[NUM_SLOTS] = {false};
+
+
+/**
+ *
+ * @param pvParameters
+ * @return
+ */
+_Noreturn void poll_weights_task(void *pvParameters) {
+
+    const char* func_tag = "poll_weights_task";
+
+    while (1) {
+
+        for (size_t slot_i = 0; slot_i < NUM_SLOTS; slot_i++) {
+            int64_t time = esp_timer_get_time();
+            int32_t upper, lower;
+            bool lower_ok = read_load_cell_data(slots[slot_i].lower_load_cell, &lower) == ESP_OK;
+            bool upper_ok = read_load_cell_data(slots[slot_i].upper_load_cell, &upper) == ESP_OK;
+            if (!lower_ok || !upper_ok) {
+                if (!lower_ok && !upper_ok) {
+                    ESP_LOGW(func_tag, "Error reading both load cells in slot %d", slot_i);
+                } else if(!upper_ok) {
+                    ESP_LOGW(func_tag, "Error reading upper load cell in slot %d", slot_i);
+                } else {
+                    ESP_LOGW(func_tag, "Error reading lower load cell in slot %d", slot_i);
+                }
+            } else {
+                // Calculate weight in grams using calibration factor
+                double raw_weight_total = (double)(upper + lower);
+                double weight_grams = raw_weight_total * slots[slot_i].calibration_factor;
+
+                // Put weight into median window
+                median_window[slot_i][median_index[slot_i]] = weight_grams;
+                median_index[slot_i] = (median_index[slot_i] + 1) % MEDIAN_FILTER_SIZE;
+
+                // Calculate median
+                double median_weight_g = get_median_weight(median_window[slot_i]);
+
+                // Put median into averaging filter window
+                average_window[slot_i][average_index[slot_i]] = median_weight_g;
+                average_index[slot_i] = (average_index[slot_i] + 1) % ROLLING_AVERAGE_FILTER_SIZE;
+
+                // Get output weight from averaging filter
+                double average_weight_g = get_average_weight(average_window[slot_i]);
+
+                // STABILITY BASED DELTA DETECTION
+                double diff = fabs(average_weight_g - last_average_value[slot_i]);
+
+                if (diff > STABLE_THRESHOLD) {
+                    // Weight changing -> user is grabbing/dropping -> ignore
+                    stable_timer[slot_i] = 0;
+                    is_stable[slot_i] = false;
+                } else {
+                    // Weight might be settled again
+                    stable_timer[slot_i] = stable_timer[slot_i] + (time - last_value_time[slot_i]);
+
+                    if (!is_stable[slot_i] && stable_timer[slot_i] >= STABLE_DURATION_MS) {
+
+                        // New stable weight detected
+                        is_stable[slot_i] = true;
+                        stable_timer[slot_i] = 0;
+                        ESP_LOGW(func_tag, "stable weight detected (slot %d)", slot_i);
+
+                        double new_weight = average_weight_g;
+                        double delta = new_weight - last_stable_weight[slot_i];
+
+                        // Only send meaningful data
+                        if (fabs(delta) > STABLE_THRESHOLD) {
+                            delta_msg_t msg;
+                            msg.delta = delta;
+                            msg.slot_id = slot_i;
+                            if(xQueueSend(delta_msg_queue, &msg, portMAX_DELAY)) {
+                                ESP_LOGD(func_tag, "Slot %d: Added delta %.5f to queue ", slot_i, delta);
+                            } else {
+                                ESP_LOGE(func_tag, "Unable to add delta weight to queue!");
+                            }
+                        }
+                        last_stable_weight[slot_i] = new_weight;
+                    }
+                }
+                last_average_value[slot_i] = average_weight_g;
+                last_value_time[slot_i] = time;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(POLLING_DELAY_MS));
+    }
+}
+
+
+/**
+ * Task to send deltas calculated from loadcells over ESP-NOW.
  * @param pvParameters parameters
  * @return This function is a task and it will never return.
  */
 _Noreturn void send_weights_task(void* pvParameters) {
 
+    delta_msg_t msg;
+
     while (1) {
 
-        // Create JSON
-        cJSON *json = cJSON_CreateObject();
-        if (json == NULL) {
-            ESP_LOGE(TAG, "Failed to create JSON object");
-            vTaskDelay(pdMS_TO_TICKS(WEIGHT_UPDATE_DELAY_MS));
-            continue;
-        }
-        cJSON *shelves_array = cJSON_AddArrayToObject(json, "slots");
-        if (shelves_array == NULL) {
-            ESP_LOGE(TAG, "Failed to create JSON array");
-            cJSON_Delete(json);
-            vTaskDelay(pdMS_TO_TICKS(WEIGHT_UPDATE_DELAY_MS));
-            continue;
-        }
+        if (xQueueReceive(delta_msg_queue, &msg, 0)) {
 
-        // Read load cell data for each slot
-        for (size_t i = 0; i < NUM_SLOTS; i++) {
-            int32_t upper, lower;
-            bool lower_ok = read_load_cell_data(slots[i].lower_load_cell, &lower) == ESP_OK;
-            bool upper_ok = read_load_cell_data(slots[i].upper_load_cell, &upper) == ESP_OK;
-            if (!lower_ok || !upper_ok) {
-                // Error reading lower load cell, add null value to data
-                if (!lower_ok && !upper_ok) {
-                    ESP_LOGW(TAG, "Error reading both load cells in slot %d", i);
-                } else if(!upper_ok) {
-                    ESP_LOGW(TAG, "Error reading upper load cell in slot %d", i);
-                } else {
-                    ESP_LOGW(TAG, "Error reading lower load cell in slot %d", i);
-                }
-                cJSON_AddItemToArray(shelves_array, cJSON_CreateNull());
-            } else {
-                double raw_weight_total = (double)(upper + lower);
-                double weight_value = raw_weight_total * slots[i].calibration_factor;
-                if (i == 3) {
-                    ESP_LOGD(TAG, "Slot %d weight value: %0.5f", i, weight_value);
-                }
-                cJSON *weight_value_json = cJSON_CreateNumber(weight_value);
-                cJSON_AddItemToArray(shelves_array, weight_value_json);
-
-                slots[i].current_raw = raw_weight_total;
-
+            // Create JSON
+            cJSON* json = cJSON_CreateObject();
+            if (json == NULL) {
+                ESP_LOGE(TAG, "Failed to create JSON object");
+                vTaskDelay(pdMS_TO_TICKS(WEIGHT_UPDATE_DELAY_MS));
+                continue;
             }
-        }
+            cJSON_AddNumberToObject(json, "slot_id", msg.slot_id);
+            cJSON_AddNumberToObject(json, "delta_g", msg.delta);
 
-        // Send JSON data to Atlas ESP32
-        char *json_string = cJSON_PrintUnformatted(json);
-        if (json_string != NULL) {
-            size_t json_len = strlen(json_string);
-            esp_now_send(atlas_mac, (uint8_t*)json_string, json_len);
-            free(json_string);
-        } else {
-            ESP_LOGE(TAG, "Failed to serialize JSON. Free heap: %lu", esp_get_free_heap_size());
-        }
+            // Send JSON data to Atlas ESP32
+            char *json_string = cJSON_PrintUnformatted(json);
+            if (json_string != NULL) {
+                size_t json_len = strlen(json_string);
+                esp_now_send(atlas_mac, (uint8_t *) json_string, json_len);
+                ESP_LOGI(TAG, "sent esp-now");
+                free(json_string);
+            } else {
+                ESP_LOGE(TAG, "Failed to serialize JSON. Free heap: %lu", esp_get_free_heap_size());
+            }
 
-        cJSON_Delete(json);
+            cJSON_Delete(json);
+        }
 
         vTaskDelay(pdMS_TO_TICKS(WEIGHT_UPDATE_DELAY_MS));
     }
@@ -442,6 +571,8 @@ void app_main(void)
 
     load_calibration();
 
+    // Create queue for sending weight values to Jetson
+    delta_msg_queue = xQueueCreate(10, sizeof(delta_msg_t));
 
     // Add ESP-NOW peer (Atlas)
     esp_now_peer_info_t en_peer_info = {
@@ -455,12 +586,11 @@ void app_main(void)
     }
 
     // Create ESP-NOW queue
-
     // Register callback for when a message is received over MQTT
     esp_now_queue = xQueueCreate(10, sizeof(message_t));
     esp_now_register_recv_cb(esp_now_message_received_isr);
 
-    xTaskCreate(send_weights_task, "send_weights_task", 2048, NULL, 4, NULL);
+    xTaskCreate(send_weights_task, "send_weights_task", 4096, NULL, 4, NULL);
     xTaskCreate(process_esp_now_msg_task, "process_esp_now_msg_task", 16384, NULL, 5, NULL);
-
+    xTaskCreate(poll_weights_task, "poll_weights_task", 2048, NULL, 5, NULL);
 }
