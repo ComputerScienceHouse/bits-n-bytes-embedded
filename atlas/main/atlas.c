@@ -90,8 +90,9 @@ typedef struct {
 // Jetson
 static QueueHandle_t jetson_q;
 typedef struct {
-    size_t num_slots;
-    double **weight_values;
+    double weight_g;
+    uint8_t slot_id;
+    char shelf_mac[MAC_ADDRESS_LENGTH];
 } jetson_msg_t;
 
 
@@ -212,56 +213,34 @@ _Noreturn void esp_now_task(void *pvParameter) {
         if (xQueueReceive(esp_now_q, &msg, portMAX_DELAY)) {
 
             // Make sure slots field exists
-            cJSON *json = cJSON_Parse((char*)msg.data);
-            if (!cJSON_HasObjectItem(json, "slots")) {
-                ESP_LOGW(func_tag, "Received ESP-NOW msg with no slots field");
-                goto free_json;
-            }
+            cJSON* json = cJSON_Parse((char*)msg.data);
 
-            // Iterate through each slot
-            cJSON *slot_array = cJSON_GetObjectItem(json, "slots");
-            int num_slots = cJSON_GetArraySize(slot_array);
+            if (cJSON_HasObjectItem(json, "slot_id") && cJSON_HasObjectItem(json, "delta_g")) {
+                // Process weight delta
 
-            if (num_slots == 0) {
-                ESP_LOGE(func_tag, "Undefined behavior: zero slots!");
-                goto free_json;
-            }
+                cJSON* slot_id_obj = cJSON_GetObjectItem(json, "slot_id");
+                cJSON* delta_g_obj = cJSON_GetObjectItem(json, "delta_g");
 
-            double** weight_values = malloc(sizeof(double*) * num_slots);
-
-            for (int i = 0; i < num_slots; i++) {
-                weight_values[i] = NULL;
-                // Try to convert item to number
-                cJSON *item = cJSON_GetArrayItem(slot_array, i);
-                if (cJSON_IsNull(item)) {
-                    ESP_LOGW(func_tag, "Received null value for slot %d of shelf %s", i, "INSERT_MAC_HERE");
-                } else if (!cJSON_IsNumber(item)) {
-                    ESP_LOGW(func_tag, "Received non-numeric slot value");
+                if (!cJSON_IsNumber(slot_id_obj)) {
+                    ESP_LOGE(func_tag, "slot_id value is not a number");
+                } else if (cJSON_IsNumber(delta_g_obj)) {
+                    ESP_LOGE(func_tag, "delta_g value is not a number");
                 } else {
-                    double value = cJSON_GetNumberValue(item);
-                    // TODO use slot weight value (process it or add it to a queue to send to the Jetson)
-                    double* weight = malloc(sizeof(double));
-                    if (weight == NULL) {
-                        ESP_LOGE(func_tag, "Failed to allocate memory for sending slot weight to jetson");
-                    } else {
-                        weight_values[i] = weight;
-                        *weight = value;
+                    jetson_msg_t jetson_msg;
+                    memcpy(jetson_msg.shelf_mac, msg.sender_mac, MAC_ADDRESS_LENGTH);
+                    jetson_msg.slot_id = (uint8_t)cJSON_GetNumberValue(slot_id_obj);
+                    jetson_msg.weight_g = cJSON_GetNumberValue(delta_g_obj);
+
+                    if (!are_doors_closed()) {
+                        if (xQueueSend(jetson_q, &jetson_msg, pdMS_TO_TICKS(10))) {
+
+                        } else {
+                            ESP_LOGW(func_tag, "Unable to add message to jetson queue. Is it full?");
+                        }
                     }
                 }
-            }
-
-            // Only send message to the Jetson if the doors are closed
-            if (!are_doors_closed()) {
-                jetson_msg_t jetson_msg;
-                jetson_msg.num_slots = num_slots;
-                jetson_msg.weight_values = weight_values;
-
-
-                if (xQueueSend(jetson_q, &jetson_msg, pdMS_TO_TICKS(10))) {
-
-                } else {
-                    ESP_LOGW(func_tag, "Unable to add message to jetson queue. Is it full?");
-                }
+            } else {
+                // Nothing to process except keep alive
             }
 
 
@@ -283,10 +262,9 @@ _Noreturn void esp_now_task(void *pvParameter) {
             } else {
                 sm_update_shelf_time(msg.sender_mac, msg.recv_time);
             }
-            free_json:
             cJSON_Delete(json);
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(25));
     }
 }
 
@@ -885,34 +863,12 @@ _Noreturn void send_to_jetson_task() {
                 // Create JSON
                 cJSON* json = cJSON_CreateObject();
 
-                // Get mac address
-                char mac_address_str[20];
-                esp_err_t err = mac_to_str(mac_address, mac_address_str);
-                if (err != ESP_OK) {
-                    ESP_LOGE(TAG, "Unable to convert mac address to string");
-                }
-                cJSON_AddStringToObject(json, "mac_address", mac_address_str);
-                cJSON* weights_array_obj = cJSON_AddArrayToObject(json, "slot_weights_g");
-
-                // Get all the weight values and add them to the JSON
-                for (size_t i = 0; i < msg.num_slots; i++) {
-                    // Get weight
-                    if (msg.weight_values[i]) {
-                        double weight_value = *msg.weight_values[i];
-                        // Add weight to JSON
-                        cJSON* weight_obj = cJSON_CreateNumber(weight_value);
-                        cJSON_AddItemToArray(weights_array_obj, weight_obj);
-                        // Free space taken by weight
-                        free(msg.weight_values[i]);
-                    }
-                }
-                // Free all other space taken by input
-                free(msg.weight_values);
+                cJSON_AddStringToObject(json, "shelf_mac", msg.shelf_mac);
+                cJSON_AddNumberToObject(json, "slot_id", msg.slot_id);
+                cJSON_AddNumberToObject(json, "delta_g", msg.weight_g);
 
                 // Write data to Jetson UART
                 char* data = cJSON_PrintUnformatted(json);
-
-
                 uart_write_bytes(JETSON_UART_PORT_NUM, data, strlen(data));
                 char *terminator = "\n";
                 uart_write_bytes(JETSON_UART_PORT_NUM, terminator, 1);
