@@ -631,7 +631,7 @@ static esp_err_t mac_to_str(const uint8_t *mac, char *mac_str_out) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    int result = snprintf(mac_str_out, 18, "%02x:%02x:%02x:%02x:%02x:%02x",
+    int result = snprintf(mac_str_out, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
                           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
     if (result != 17) {  // Expected length is 17 characters (plus null terminator)
@@ -863,7 +863,10 @@ _Noreturn void send_to_jetson_task() {
                 // Create JSON
                 cJSON* json = cJSON_CreateObject();
 
-                cJSON_AddStringToObject(json, "shelf_mac", msg.shelf_mac);
+                char mac_str[20];
+                mac_to_str((uint8_t*)msg.shelf_mac, mac_str);
+
+                cJSON_AddStringToObject(json, "shelf_mac", mac_str);
                 cJSON_AddNumberToObject(json, "slot_id", msg.slot_id);
                 cJSON_AddNumberToObject(json, "delta_g", msg.weight_g);
 
