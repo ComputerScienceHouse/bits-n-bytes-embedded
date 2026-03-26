@@ -42,14 +42,14 @@
 #define PI_UART_TX_PIN      (17)
 #define PI_UART_RX_PIN      (16)
 #define PI_UART_PORT_NUM    UART_NUM_2
-#define PI_UART_BAUD_RATE   9600
+#define PI_UART_BAUD_RATE   (9600)
 
 #define PAYLOAD_SIZE        (7)
 
 // LED Definitions
-#define RED_PIN             (12)
-#define GREEN_PIN           (13)
-#define BLUE_PIN            (14)
+#define RED_PIN             (0)
+#define GREEN_PIN           (25)
+#define BLUE_PIN            (4)
 
 #define LED_FREQ            (5000)
 #define LED_TIMER           (0)
@@ -208,14 +208,14 @@ void init_led() {
 }
 
 void setColor(uint8_t r, uint8_t g, uint8_t b) {
-    ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0, r);
-    ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0);
+    ledc_set_duty(LEDC_HIGH_SPEED_MODE, RED_CHANNEL, r);
+    ledc_update_duty(LEDC_HIGH_SPEED_MODE, RED_CHANNEL);
 
-    ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1, g);
-    ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1);
+    ledc_set_duty(LEDC_HIGH_SPEED_MODE, GREEN_CHANNEL, g);
+    ledc_update_duty(LEDC_HIGH_SPEED_MODE, GREEN_CHANNEL);
 
-    ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_2, b);
-    ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_2);
+    ledc_set_duty(LEDC_HIGH_SPEED_MODE, BLUE_CHANNEL, b);
+    ledc_update_duty(LEDC_HIGH_SPEED_MODE, BLUE_CHANNEL);
 }
 
 void app_main() {
@@ -227,6 +227,7 @@ void app_main() {
     pn532_i2c_init();
     init_uart();
     init_gpio();
+    init_led();
 
     bool color_toggle = false; // false = orange, true = purple
     
@@ -234,9 +235,9 @@ void app_main() {
         uint8_t *tx_payload = (uint8_t *) malloc(PI_UART_RX_BUFFER_SIZE);
         
         int rx_len = uart_read_bytes(PI_UART_PORT_NUM, tx_payload, PAYLOAD_SIZE, 50 / portTICK_PERIOD_MS);
-
-        ESP_LOGI(UART_TAG, "ACK Received from Pi (RX)! %d", rx_len);
+        
         if (rx_len > 0) {
+            ESP_LOGI(UART_TAG, "ACK Received from Pi (RX)! %d", rx_len);
             ESP_LOG_BUFFER_HEX(UART_TAG, tx_payload, sizeof(tx_payload));
         }
         
@@ -246,7 +247,15 @@ void app_main() {
             ESP_LOG_BUFFER_HEXDUMP(UART_TAG, tx_payload, sizeof(tx_payload), ESP_LOG_INFO);
 
             response = run_nfc();
+            // flicker green when it reads a valid ID
+            for (int x = 0; x < 10; x++) {
+                setColor(0,255,0);
+                vTaskDelay(pdMS_TO_TICKS(300));
+                setColor(0,0,0);
+                vTaskDelay(pdMS_TO_TICKS(300));
+            }
 
+            // send data over UART
             uart_send_data(response.uid);
             ESP_LOG_BUFFER_HEXDUMP(UART_TAG, response.uid, response.length, ESP_LOG_DEBUG);
         }
@@ -255,7 +264,7 @@ void app_main() {
         if (color_toggle) {
             setColor(128,0,128);
         } else {
-            setColor(255,165,0);
+            setColor(255,40,0);
         }
         color_toggle = !color_toggle;
 
