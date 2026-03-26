@@ -62,5 +62,5 @@ idf.py flash
 The easiest way to debug the component during runtime is by monitoring the esp32. This can be done using the following command:
 ```
 idf.py monitor
-``
-> Note: It is useful to add ESP-specific logging functions, for example `ESP_LOGI()`,`ESP_LOGW()`,etc. as these are specifically made to be printed for the monitor command.
+```
+> Note: It is useful to add ESP-specific logging functions, such as `ESP_LOGI` for general logs and `ESP_LOGW`for warnings, as the usual print methods don't work with the monitor command.
