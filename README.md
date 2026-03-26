@@ -2,7 +2,8 @@
 Bits 'n Bytes is a next generation vending machine by Computer Science House. This repository contains the software for the various sensors and actuators embedded in the cabinet.
 
 # Contributing or Distributing
-To contribute to the project or distribute it to targets (ESP32s), you will first need to prepare your environment. Note that I have only done this on MacOS machines, so the instructions here might not work exactly for Linux or Windows. Feel free to make a PR and update them based on your own experience!
+To contribute to the project or distribute it to targets (ESP32s), you will first need to prepare your environment. Currently, these modules have been tested with MacOS and Windows, but should work for any operating system.
+
 ## 1. Install ESP-IDF
 This project is built on ESP-IDF.
 
@@ -34,9 +35,9 @@ cd ~/Documents/bits-n-bytes-embedded/shelf
 ```
 
 ## 5. Set the Target Device
-By default, the target device is `esp32`. For Bits 'n Bytes, we have been using ESP32-S2. To reflect this, run
+By default, the target device is `esp32`. For Bits 'n Bytes, this is the correct device. Should you run into errors pertaining to this, you can manually set the target device using the following command: 
 ```
-idf.py set-target esp32s2
+idf.py set-target esp32
 ```
 
 ## 6. Open Menuconfig
@@ -50,3 +51,16 @@ Once it opens, just hit `q` to quit. You don't need to modify any settings.
 ```
 idf.py build
 ```
+
+## 8. Flash the Component
+Once you have verified that the component has built sucessfully, you must flash the compiled file to the esp32. This can be done using the following command:
+```
+idf.py flash
+```
+
+## 9. Monitor the Device
+The easiest way to debug the component during runtime is by monitoring the esp32. This can be done using the following command:
+```
+idf.py monitor
+``
+> Note: It is useful to add ESP-specific logging functions, for example `ESP_LOGI()`,`ESP_LOGW()`,etc. as these are specifically made to be printed for the monitor command.
