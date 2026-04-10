@@ -76,6 +76,9 @@ uint8_t mac_address[MAC_ADDRESS_LENGTH];
 // Handle for cabinet LED strip
 led_strip_handle_t led_strip = NULL;
 
+// Enable LED change based on doors
+#define LED_ON_DOOR  false
+
 
 // ESP-NOW
 static QueueHandle_t esp_now_q;
@@ -564,7 +567,7 @@ _Noreturn void update_leds_task() {
         bool doors_closed = are_doors_closed();
 
         float target_mix = 0.0f;
-        if (doors_closed) {
+        if (doors_closed || !LED_ON_DOOR) {
             target_mix = 1.0f;
             fade_mix_toward(target_mix, 0.05f);
         } else {
@@ -837,8 +840,7 @@ _Noreturn void read_from_pi_task() {
                         ESP_LOGW(TAG, "Invalid calibration request");
                     }
                 }
-
-free_json:
+            free_json:
                 cJSON_Delete(json);
             }
         }

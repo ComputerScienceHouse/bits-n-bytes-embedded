@@ -1,0 +1,32 @@
+.pytest_cache/
+__pycache__/
+
+# esp-idf built binaries
+build/
+build_*_*/
+sdkconfig
+sdkconfig.old
+
+# idf-ci build run output
+build_summary_*.xml
+app_info_*.txt
+size_info_*.txt
+
+# pytest-embedded log folder
+pytest_embedded_log/
+
+# idf-component-manager output
+dependencies.lock
+
+# extras
+managed_components/
+.vscode/
+
+# test files
+test-*.c
+
+# esp logs
+log.*.txt
+
+# temp markdown
+COMMANDS.md
