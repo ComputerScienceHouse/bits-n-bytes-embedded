@@ -41,7 +41,7 @@
 // Pi Communication Definitions
 #define PI_UART_TX_PIN      (17)
 #define PI_UART_RX_PIN      (16)
-#define PI_UART_PORT_NUM    UART_NUM_2
+#define PI_UART_PORT_NUM    UART_NUM_3
 #define PI_UART_BAUD_RATE   (9600)
 
 #define PAYLOAD_SIZE        (7)
@@ -104,6 +104,8 @@ void pn532_i2c_init() {
     
     ESP_LOGI(I2C_TAG, "Initializing PN532...");
     ESP_ERROR_CHECK(pn532_new_driver_i2c(SDA_PIN, SCL_PIN, RESET_PIN, IRQ_PIN, 0, &pn532_io));
+    // set timeout for pn532 to be longer incase of boot errors
+    i2c_set_timeout(I2C_NUM_0, 1000000);
 
     do {
         err = pn532_init(&pn532_io);
@@ -232,7 +234,7 @@ void app_main() {
     bool color_toggle = false; // false = orange, true = purple
     
     while (1) {
-        uint8_t *tx_payload = (uint8_t *) malloc(PI_UART_RX_BUFFER_SIZE);
+        uint8_t tx_payload[PI_UART_RX_BUFFER_SIZE];
         
         int rx_len = uart_read_bytes(PI_UART_PORT_NUM, tx_payload, PAYLOAD_SIZE, 50 / portTICK_PERIOD_MS);
         
@@ -261,13 +263,17 @@ void app_main() {
         }
 
         // Swap between the colors
-        if (color_toggle) {
-            setColor(128,0,128);
-        } else {
-            setColor(255,40,0);
-        }
-        color_toggle = !color_toggle;
+        // if (color_toggle) {
+        //     setColor(128,0,128);
+        // } else {
+        //     setColor(255,40,0);
+        // }
+        // color_toggle = !color_toggle;
 
+        uint8_t a[7] = {0xFF,0x00,0x00,0x00,0x00,0x00,0x00,};
+
+        uart_send_data(a);
+        ESP_LOGI(TAG,"working");
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
     vTaskDelay(pdMS_TO_TICKS(100));
