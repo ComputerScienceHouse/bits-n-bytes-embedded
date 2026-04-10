@@ -77,7 +77,7 @@ uint8_t mac_address[MAC_ADDRESS_LENGTH];
 led_strip_handle_t led_strip = NULL;
 
 // Enable LED change based on doors
-#define LED_ON_DOOR  false
+#define LED_ON_DOOR  true
 
 
 // ESP-NOW
