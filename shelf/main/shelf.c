@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <stdio.h>
 #include <mqtt_client.h>
 #include <driver/gpio.h>
@@ -17,8 +18,9 @@
 // Slots
 #define NUM_SLOTS 4
 
-// ESP-NOW buffer
+// Buffers
 #define ESP_NOW_BUFFER_SIZE 300
+#define POSITION_BUFFER_SIZE 20
 
 // Timing definition
 #define SHELF_COMM_MINIMUM_TIME 250
@@ -54,6 +56,7 @@ typedef struct {
     hx711_t *lower_load_cell;
 } slot_t ;
 slot_t *slots = NULL;
+SemaphoreHandle_t slots_lock;
 
 // TODO remove atlas mac, this should not be hardcoded
 uint8_t atlas_mac[ESP_NOW_ETH_ALEN] = {0x30, 0xC6, 0xF7, 0x29, 0xE1, 0x90};
@@ -78,6 +81,9 @@ static QueueHandle_t delta_msg_queue;
 // Logging tag
 static const char* TAG = "shelf";
 
+// Position tracking
+SemaphoreHandle_t position_lock = NULL;
+char position[POSITION_BUFFER_SIZE];
 
 /**
  * Configure GPIO pins
@@ -217,8 +223,13 @@ void init_load_cells() {
     }
 }
 
-void load_calibration() {
+/**
+ * Load persistent data from NVS on boot, including stored calibration values
+ * and
+ */
+void load_persistent_data() {
 
+    // Open the storage to get prepared for reading
     nvs_handle_t nvs_handle;
     esp_err_t err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK) {
@@ -226,8 +237,8 @@ void load_calibration() {
         abort();
     }
 
+    // Load the stored calibration values for each slot
     for (size_t i = 0; i < NUM_SLOTS; i++) {
-
         char storage_key[20];
         sprintf(storage_key, "slot_%d_cal", i);
         double calibration_value = 1.0;
@@ -249,7 +260,36 @@ void load_calibration() {
                 break;
         }
     }
+
+    // Load the slot direction. This only matters so that we can compare against future packets
+    // and know when to "switch" directions (swap slot pointers).
+    const char* position_key = "position";
+    char position_value[POSITION_BUFFER_SIZE] = "right"; // Default to right ifr nothing in NVS
+    size_t size = sizeof(position_value);
+    err = nvs_get_blob(nvs_handle, position_key, &position_value, &size);
+    switch (err) {
+        case ESP_OK:
+            break;
+        case ESP_ERR_NVS_NOT_FOUND:
+            nvs_set_blob(nvs_handle, position_key, &position_value, size);
+            nvs_commit(nvs_handle);
+            break;
+        default:
+            ESP_LOGE(TAG, "Error reading NVS values!");
+            nvs_close(nvs_handle);
+            abort();
+            break;
+    }
+    // Make sure to close the handle to NVS
     nvs_close(nvs_handle);
+
+    // Store the position for reference during runtime
+    if (xSemaphoreTake(position_lock, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        strcpy(position, position_value);
+    } else {
+        ESP_LOGE(TAG, "Failed to store position location, restarting");
+        abort();
+    }
 }
 
 
@@ -292,6 +332,94 @@ static esp_err_t calc_conversion_factor(double previous_val, double current_val,
         *output = (double)tare_weight / (current_val - previous_val);
         return ESP_OK;
     }
+}
+
+/**
+ * Task to update the position of this shelf.
+ * @param pvParameters the new position as a string
+ * otherwise the comparison might not work properly.
+ */
+void update_position_task(void* pvParameters) {
+
+    const char* tag = "update_position_task"; // log tag
+
+    // Normalize new position to lowercase
+    const char* new_position_mixed_case = (const char*)pvParameters;
+    char new_position[strlen(new_position_mixed_case) + 1];
+    for (size_t i = 0; i < strlen(new_position_mixed_case); i++) {
+        new_position[i] = tolower(new_position_mixed_case[i]);
+    }
+    new_position[strlen(new_position_mixed_case)] = '\0';
+
+    // Get position lock
+    while (!xSemaphoreTake(position_lock, pdMS_TO_TICKS(5000))) {
+        ESP_LOGW(tag, "Failed to take position lock, retrying");
+    }
+
+    // Check if position changed
+    if (strcmp(new_position, position) == 0) {
+        // No change, no need to do anything
+        xSemaphoreGive(position_lock);
+        vTaskDelete(NULL);
+    }
+    // The position did change and the slots will need to be flipped
+    // Get slots lock so we can modify them
+    while (!xSemaphoreTake(slots_lock, pdMS_TO_TICKS(5000))) {
+        ESP_LOGW(tag, "Failed to take slots lock, retrying");
+    }
+
+    // Check that we're switching from 'left' to 'right' or vise versa
+    if (
+        (strcmp(position, "left") == 0 && strcmp(new_position, "right") == 0)
+        || (strcmp(position, "right") == 0 && strcmp(new_position, "left") == 0)
+        )
+    {
+
+        // Open NVS so that new position persists through reboots
+        nvs_handle_t nvs_handle;
+        esp_err_t err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(tag, "Failed to open NVS to store updated position. This position update will be ignored.");
+            goto end;
+        }
+
+        // Write new position to NVS
+        err = nvs_set_str(nvs_handle, "position", new_position);
+        if (err != ESP_OK) {
+            ESP_LOGE(tag, "Failed to write to NVS to store updated position. This position will update will be ignored.");
+            nvs_close(nvs_handle);
+            goto end;
+        }
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+
+        // Wrote to NVS successfully, so now we can actually flip the shelves
+
+        // Only iterate through half because we're swapping the lower half of
+        // pointers with the upper half. For an odd number of slots, the middle
+        // does not need to be swapped at all, therefore the floor (a byproduct
+        // of integer division) is the right calculation.
+        for (size_t left_p = 0; left_p < NUM_SLOTS / 2; left_p++) {
+            const size_t right_p = NUM_SLOTS - 1 - left_p;
+            // Do the swap
+            const slot_t temp = slots[left_p];
+            slots[left_p] = slots[right_p];
+            slots[right_p] = temp;
+        }
+
+        // Store new position in global state
+        strcpy(position, new_position);
+    } else {
+        ESP_LOGW(tag, "Received invalid position: '%s', can't swap to this.", new_position);
+    }
+
+end:
+    // Give up all locks
+    xSemaphoreGive(slots_lock);
+    xSemaphoreGive(position_lock);
+
+    // Clean up this one-shot task
+    vTaskDelete(NULL);
 }
 
 
@@ -355,8 +483,20 @@ _Noreturn void process_esp_now_msg_task(void* pvParameters) {
                 } else {
                     ESP_LOGW(TAG, "Received bad JSON packet over ESP-NOW: %s", msg.data);
                 }
+            } else if (cJSON_HasObjectItem(json, "position")) {
+                cJSON* position_obj = cJSON_GetObjectItem(json, "position");
+                if (cJSON_IsString(position_obj)) {
+                    char* position_value = cJSON_GetStringValue(position_obj);
+
+                    // Save position to machine
+                    xTaskCreate(update_position_task, "update_position_task", 4096, position_value, 4, NULL);
+
+                } else {
+                    ESP_LOGW(TAG, "Received non-string position value");
+                }
             } else {
-                ESP_LOGW(TAG, "Calibration packet received without slot_id or weight_g fields");
+
+                ESP_LOGW(TAG, "Received calibration packet with no slot/weight or no position information");
             }
             // Free memory
             cJSON_Delete(json);
@@ -570,7 +710,7 @@ void app_main(void)
     init_load_cells();
     ESP_LOGD(TAG, "Initialized load cells");
 
-    load_calibration();
+    load_persistent_data();
 
     // Create queue for sending weight values to Jetson
     delta_msg_queue = xQueueCreate(10, sizeof(delta_msg_t));
