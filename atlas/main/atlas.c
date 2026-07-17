@@ -459,7 +459,7 @@ float leds_rainbow_chase(float hue_offset) {
         uint8_t r, g, b;
         float hue = fmodf(hue_offset + (360.0f * i / NUM_LEDS), 360.0f);
         hsv_to_rgb(hue, 1.0f, 1.0f, &r, &g, &b);
-        uint8_t rw = 255, gw = 255, bw = 255;
+        uint8_t rw = 125, gw = 125, bw = 125;
         uint8_t rf = (uint8_t)(fade_mix * r + (1.0f - fade_mix) * rw);
         uint8_t gf = (uint8_t)(fade_mix * g + (1.0f - fade_mix) * gw);
         uint8_t bf = (uint8_t)(fade_mix * b + (1.0f - fade_mix) * bw);
@@ -496,14 +496,14 @@ float leds_bnb_color_chase(float phase) {
 
         if (block_index % 2 == 0) {
             // Orange block
-            uint8_t rw = 255, gw = 255, bw = 255;
+            uint8_t rw = 125, gw = 125, bw = 125;
             uint8_t rf = (uint8_t)(fade_mix * 250 + (1.0f - fade_mix) * rw);
             uint8_t gf = (uint8_t)(fade_mix * 25 + (1.0f - fade_mix) * gw);
             uint8_t bf = (uint8_t)(fade_mix * 0 + (1.0f - fade_mix) * bw);
             err = led_strip_set_pixel(led_strip, i, rf, gf, bf);
         } else {
             // Purple block
-            uint8_t rw = 255, gw = 255, bw = 255;
+            uint8_t rw = 125, gw = 125, bw = 125;
             uint8_t rf = (uint8_t)(fade_mix * 130 + (1.0f - fade_mix) * rw);
             uint8_t gf = (uint8_t)(fade_mix * 0 + (1.0f - fade_mix) * gw);
             uint8_t bf = (uint8_t)(fade_mix * 250 + (1.0f - fade_mix) * bw);
@@ -529,7 +529,7 @@ float leds_rainbow_gradient(float hue) {
     hue = fmodf(hue + 2.0f, 360.0f);
     for (int i = 0; i < NUM_LEDS; i++) {
         hsv_to_rgb(hue, 1.0f, 1.0f, &r, &g, &b);
-        uint8_t rw = 255, gw = 255, bw = 255;
+        uint8_t rw = 125, gw = 125, bw = 125;
         uint8_t rf = (uint8_t)(fade_mix * r + (1.0f - fade_mix) * rw);
         uint8_t gf = (uint8_t)(fade_mix * g + (1.0f - fade_mix) * gw);
         uint8_t bf = (uint8_t)(fade_mix * b + (1.0f - fade_mix) * bw);
