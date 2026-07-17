@@ -654,6 +654,9 @@ void poll_weights_task(void *pvParameters) {
  */
 _Noreturn void send_weights_task(void* pvParameters) {
 
+
+    const char* tag = "send_weights_task";
+
     delta_msg_t msg;
 
     while (1) {
@@ -664,6 +667,17 @@ _Noreturn void send_weights_task(void* pvParameters) {
             ESP_LOGE(TAG, "Failed to create JSON object");
             vTaskDelay(pdMS_TO_TICKS(SHELF_COMM_MINIMUM_TIME));
             continue;
+        }
+
+        // Capture position, if possible
+        char position_value[POSITION_BUFFER_SIZE] = "";
+        if (xSemaphoreTake(position_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+            strcpy(position_value, position);
+            xSemaphoreGive(position_lock);
+            // Add to JSON
+            cJSON_AddStringToObject(json, "position", position_value);
+        } else {
+            ESP_LOGW(tag, "Failed to get position lock, ignoring position for this update to Atlas.");
         }
 
         // If there is shelf data, get it, or wait max delay amount
