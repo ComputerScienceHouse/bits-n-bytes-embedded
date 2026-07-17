@@ -286,6 +286,7 @@ void load_persistent_data() {
     // Store the position for reference during runtime
     if (xSemaphoreTake(position_lock, pdMS_TO_TICKS(5000)) == pdTRUE) {
         strcpy(position, position_value);
+        xSemaphoreGive(position_lock);
     } else {
         ESP_LOGE(TAG, "Failed to store position location, restarting");
         abort();
