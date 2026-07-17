@@ -696,6 +696,9 @@ _Noreturn void send_weights_task(void* pvParameters) {
 void app_main(void)
 {
 
+    slots_lock = xSemaphoreCreateMutex();
+    position_lock = xSemaphoreCreateMutex();
+
     nvs_flash_init();
     ESP_LOGD(TAG, "Initialized NVS");
     configure_pins();
