@@ -15,6 +15,7 @@
 #include "math.h"
 #include "esp_timer.h"
 #include "bnb_protocol.h"
+#include "bnb_ack.h"
 
 // Slots
 #define NUM_SLOTS 4
@@ -295,7 +296,14 @@ void load_persistent_data() {
 }
 
 
-void esp_now_message_received_isr(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+/**
+ * Callback for when a message is received over ESP-NOW. Despite the ESP-NOW
+ * driver naming convention suggesting otherwise, this runs from the Wi-Fi
+ * task, not a hardware ISR (see ESP-IDF's esp_now docs: "the receiving
+ * callback function also runs from the Wi-Fi task") -- so a plain
+ * xQueueSend is correct here, matching atlas.c's equivalent callback.
+ */
+void esp_now_message_received_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     // Check if any data was received
     if (!data || len <= 0) return;
 
@@ -310,12 +318,7 @@ void esp_now_message_received_isr(const esp_now_recv_info_t *info, const uint8_t
     memcpy(msg.data, data, len);
     msg.length = len;
 
-    // Send to queue from ISR
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xQueueSendFromISR(esp_now_queue, &msg, &xHigherPriorityTaskWoken);
-    if (xHigherPriorityTaskWoken) {
-        portYIELD_FROM_ISR();
-    }
+    xQueueSend(esp_now_queue, &msg, pdMS_TO_TICKS(500));
 }
 
 /**
@@ -430,34 +433,41 @@ end:
 }
 
 
-_Noreturn void process_esp_now_msg_task(void* pvParameters) {
+/**
+ * bnb_ack transmit callback: put an envelope on the wire via esp_now_send.
+ */
+static void shelf_on_transmit(const uint8_t peer_mac[6], const uint8_t *envelope, size_t envelope_len, void *ctx) {
+    esp_err_t send_err = esp_now_send(peer_mac, envelope, envelope_len);
+    if (send_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to send message over ESP-NOW");
+    }
+}
 
-    message_t msg;
+/**
+ * bnb_ack failed callback: a reliable send (this shelf's status update) was
+ * never acked after BNB_ACK_MAX_SEND_RETRIES. Single hardcoded peer, so
+ * there's nothing further to do beyond logging.
+ */
+static void shelf_on_message_failed(const uint8_t peer_mac[6], bnb_msg_type_t type, uint16_t seq_id, void *ctx) {
+    ESP_LOGE(TAG, "Giving up on reliable delivery of type %d seq %u", type, seq_id);
+}
 
-    while (1) {
+/**
+ * bnb_ack delivered callback: called exactly once per unique, deduplicated
+ * inbound message. Dispatches by JSON key presence, same logic that used
+ * to live directly in process_esp_now_msg_task before decode/dedup/retry
+ * moved into bnb_ack.
+ */
+static void shelf_on_message_delivered(const uint8_t peer_mac[6], bnb_msg_type_t type,
+                                        const uint8_t *payload, size_t payload_len, void *ctx) {
+    // Payload is not guaranteed to be NUL-terminated by the envelope; make it a C string for cJSON
+    char payload_str[BNB_PROTOCOL_MAX_PAYLOAD_LEN + 1];
+    memcpy(payload_str, payload, payload_len);
+    payload_str[payload_len] = '\0';
 
-        // Get next message from the queue
-        if (xQueueReceive(esp_now_queue, &msg, portMAX_DELAY)) {
+    cJSON *json = cJSON_Parse(payload_str);
 
-            // Decode and checksum-validate the envelope before touching the payload
-            bnb_msg_type_t msg_type;
-            uint8_t payload[BNB_PROTOCOL_MAX_PAYLOAD_LEN];
-            size_t payload_len;
-            esp_err_t decode_err = bnb_protocol_decode((uint8_t*)msg.data, msg.length, &msg_type,
-                                                         payload, sizeof(payload), &payload_len);
-            if (decode_err != ESP_OK) {
-                ESP_LOGW(TAG, "Dropping ESP-NOW message that failed to decode: %s", esp_err_to_name(decode_err));
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
-            }
-            // Payload is not guaranteed to be NUL-terminated by the envelope; make it a C string for cJSON
-            char payload_str[BNB_PROTOCOL_MAX_PAYLOAD_LEN + 1];
-            memcpy(payload_str, payload, payload_len);
-            payload_str[payload_len] = '\0';
-
-            cJSON *json = cJSON_Parse(payload_str);
-
-            // Make sure the slot_id and the weight_g exist
+    // Make sure the slot_id and the weight_g exist
             if (cJSON_HasObjectItem(json, "slot_id") && cJSON_HasObjectItem(json, "weight_g")) {
 
                 // Get the objects
@@ -505,7 +515,7 @@ _Noreturn void process_esp_now_msg_task(void* pvParameters) {
                         ESP_LOGW(TAG, "Received slot ID exceeding max number of slots on this shelf");
                     }
                 } else {
-                    ESP_LOGW(TAG, "Received bad JSON packet over ESP-NOW: %s", msg.data);
+                    ESP_LOGW(TAG, "Received bad JSON packet over ESP-NOW: %s", payload_str);
                 }
             } else if (cJSON_HasObjectItem(json, "position")) {
                 cJSON* position_obj = cJSON_GetObjectItem(json, "position");
@@ -526,12 +536,23 @@ _Noreturn void process_esp_now_msg_task(void* pvParameters) {
                 } else {
                     ESP_LOGW(TAG, "Received non-string position value");
                 }
-            } else {
+    } else {
 
-                ESP_LOGW(TAG, "Received calibration packet with no slot/weight or no position information");
-            }
-            // Free memory
-            cJSON_Delete(json);
+        ESP_LOGW(TAG, "Received calibration packet with no slot/weight or no position information");
+    }
+    // Free memory
+    cJSON_Delete(json);
+}
+
+_Noreturn void process_esp_now_msg_task(void* pvParameters) {
+
+    message_t msg;
+
+    while (1) {
+
+        // Get next message from the queue
+        if (xQueueReceive(esp_now_queue, &msg, portMAX_DELAY)) {
+            bnb_ack_handle_incoming(atlas_mac, (uint8_t*)msg.data, msg.length);
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -718,20 +739,12 @@ _Noreturn void send_weights_task(void* pvParameters) {
             cJSON_AddNumberToObject(json, "delta_g", msg.delta);
         }
 
-        // Encode into a checksummed envelope and send to Atlas ESP32
+        // Queue for reliable (QoS2) delivery to Atlas
         char *json_string = cJSON_PrintUnformatted(json);
         if (json_string != NULL) {
-            uint8_t envelope[BNB_PROTOCOL_MAX_ENVELOPE_LEN];
-            size_t envelope_len;
-            esp_err_t enc_err = bnb_protocol_encode(BNB_MSG_SHELF_STATUS, json_string, strlen(json_string),
-                                                     envelope, sizeof(envelope), &envelope_len);
-            if (enc_err == ESP_OK) {
-                esp_err_t send_err = esp_now_send(atlas_mac, envelope, envelope_len);
-                if (send_err != ESP_OK) {
-                    ESP_LOGW(TAG, "Failed to send message over ESP-NOW");
-                }
-            } else {
-                ESP_LOGE(TAG, "Failed to encode shelf status envelope: %s", esp_err_to_name(enc_err));
+            esp_err_t send_err = bnb_ack_send_reliable(atlas_mac, BNB_MSG_SHELF_STATUS, json_string, strlen(json_string));
+            if (send_err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to queue reliable status send: %s", esp_err_to_name(send_err));
             }
             free(json_string);
         } else {
@@ -788,7 +801,9 @@ void app_main(void)
     // Create ESP-NOW queue
     // Register callback for when a message is received over MQTT
     esp_now_queue = xQueueCreate(10, sizeof(message_t));
-    esp_now_register_recv_cb(esp_now_message_received_isr);
+    esp_now_register_recv_cb(esp_now_message_received_cb);
+
+    bnb_ack_init(1, shelf_on_transmit, shelf_on_message_delivered, shelf_on_message_failed, NULL);
 
     xTaskCreate(send_weights_task, "send_weights_task", 4096, NULL, 4, NULL);
     xTaskCreate(process_esp_now_msg_task, "process_esp_now_msg_task", 16384, NULL, 5, NULL);

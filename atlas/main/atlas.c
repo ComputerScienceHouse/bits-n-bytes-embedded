@@ -27,6 +27,7 @@
 #include "shelf_manager.h"
 #include <esp_mac.h>
 #include "bnb_protocol.h"
+#include "bnb_ack.h"
 
 // Pins
 #define INTERNAL_LED_PIN 2
@@ -57,7 +58,7 @@ static const int jetson_uart_tx_buffer_size = 1024;
 #define ESP_NOW_QUEUE_MAX_MS 500
 
 // Shelves
-#define MAX_NUM_SHELVES
+#define MAX_NUM_SHELVES 10
 
 // Timing
 #define DOOR_TRIGGER_DELAY_MS 100 // Leaving latches open for too long is harmful
@@ -202,6 +203,84 @@ void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int l
 
 
 /**
+ * bnb_ack transmit callback: put an envelope on the wire via esp_now_send.
+ */
+static void atlas_on_transmit(const uint8_t peer_mac[6], const uint8_t *envelope, size_t envelope_len, void *ctx) {
+    esp_err_t err = esp_now_send(peer_mac, envelope, envelope_len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_now_send failed: %s", esp_err_to_name(err));
+    }
+}
+
+/**
+ * bnb_ack delivered callback: called exactly once per unique, deduplicated
+ * inbound message. Dispatches by JSON key presence, same logic that used
+ * to live directly in esp_now_task before decode/dedup/retry moved into
+ * bnb_ack.
+ */
+static void atlas_on_message_delivered(const uint8_t peer_mac[6], bnb_msg_type_t type,
+                                        const uint8_t *payload, size_t payload_len, void *ctx) {
+    const char* func_tag = "atlas_on_message_delivered";
+
+    // Payload is not guaranteed to be NUL-terminated by the envelope; make it a C string for cJSON
+    char payload_str[BNB_PROTOCOL_MAX_PAYLOAD_LEN + 1];
+    memcpy(payload_str, payload, payload_len);
+    payload_str[payload_len] = '\0';
+
+    cJSON* json = cJSON_Parse(payload_str);
+
+    // Check for slot update
+    if (cJSON_HasObjectItem(json, "slot_id") && cJSON_HasObjectItem(json, "delta_g")) {
+        // Process weight delta
+
+        cJSON* slot_id_obj = cJSON_GetObjectItem(json, "slot_id");
+        cJSON* delta_g_obj = cJSON_GetObjectItem(json, "delta_g");
+
+        if (!cJSON_IsNumber(slot_id_obj)) {
+            ESP_LOGE(func_tag, "slot_id value is not a number");
+        } else if (!cJSON_IsNumber(delta_g_obj)) {
+            ESP_LOGE(func_tag, "delta_g value is not a number");
+        } else {
+            jetson_msg_t jetson_msg;
+            memcpy(jetson_msg.shelf_mac, peer_mac, MAC_ADDRESS_LENGTH);
+            jetson_msg.slot_id = (uint8_t)cJSON_GetNumberValue(slot_id_obj);
+            jetson_msg.weight_g = cJSON_GetNumberValue(delta_g_obj);
+
+            if (!are_doors_closed()) {
+                if (xQueueSend(jetson_q, &jetson_msg, pdMS_TO_TICKS(10))) {
+
+                } else {
+                    ESP_LOGW(func_tag, "Unable to add message to jetson queue. Is it full?");
+                }
+            }
+        }
+    }
+
+    // Check for position update. esp_now_task already recorded a bare
+    // liveness ping (empty position) for this shelf before this callback
+    // ran; refine it with the real position now that the JSON is parsed.
+    if (cJSON_HasObjectItem(json, "position")) {
+        cJSON* position_obj = cJSON_GetObjectItem(json, "position");
+        char* position_str = cJSON_GetStringValue(position_obj);
+        char position[SM_POSITION_BUFFER_SIZE] = "";
+        strcpy(position, position_str);
+        sm_update_shelf_time((uint8_t*)peer_mac, esp_timer_get_time(), position);
+    }
+
+    cJSON_Delete(json);
+}
+
+/**
+ * bnb_ack failed callback: a reliable send was never acked after
+ * BNB_ACK_MAX_SEND_RETRIES. shelf_manager's own 3s-silence eviction already
+ * handles a truly-gone shelf independently, so no further action is taken
+ * here beyond logging.
+ */
+static void atlas_on_message_failed(const uint8_t peer_mac[6], bnb_msg_type_t type, uint16_t seq_id, void *ctx) {
+    ESP_LOGE(TAG, "Giving up on reliable delivery of type %d seq %u", type, seq_id);
+}
+
+/**
  * Task for processing messages received over ESP-NOW.
  * @param pvParameter
  * @return this is a task and it will never return.
@@ -210,70 +289,20 @@ _Noreturn void esp_now_task(void *pvParameter) {
 
     esp_now_msg_t msg;
 
-    const char* func_tag = "esp_now_task";
-
     while (true) {
 
         if (xQueueReceive(esp_now_q, &msg, portMAX_DELAY)) {
 
-            // Decode and checksum-validate the envelope before touching the payload
-            bnb_msg_type_t msg_type;
-            uint8_t payload[BNB_PROTOCOL_MAX_PAYLOAD_LEN];
-            size_t payload_len;
-            esp_err_t decode_err = bnb_protocol_decode(msg.data, msg.len, &msg_type,
-                                                         payload, sizeof(payload), &payload_len);
-            if (decode_err != ESP_OK) {
-                ESP_LOGW(func_tag, "Dropping ESP-NOW message that failed to decode: %s", esp_err_to_name(decode_err));
-                vTaskDelay(pdMS_TO_TICKS(25));
-                continue;
-            }
-            // Payload is not guaranteed to be NUL-terminated by the envelope; make it a C string for cJSON
-            char payload_str[BNB_PROTOCOL_MAX_PAYLOAD_LEN + 1];
-            memcpy(payload_str, payload, payload_len);
-            payload_str[payload_len] = '\0';
+            bnb_ack_handle_incoming(msg.sender_mac, msg.data, msg.len);
 
-            // Make sure slots field exists
-            cJSON* json = cJSON_Parse(payload_str);
-
-            // Check for slot update
-            if (cJSON_HasObjectItem(json, "slot_id") && cJSON_HasObjectItem(json, "delta_g")) {
-                // Process weight delta
-
-                cJSON* slot_id_obj = cJSON_GetObjectItem(json, "slot_id");
-                cJSON* delta_g_obj = cJSON_GetObjectItem(json, "delta_g");
-
-                if (!cJSON_IsNumber(slot_id_obj)) {
-                    ESP_LOGE(func_tag, "slot_id value is not a number");
-                } else if (!cJSON_IsNumber(delta_g_obj)) {
-                    ESP_LOGE(func_tag, "delta_g value is not a number");
-                } else {
-                    jetson_msg_t jetson_msg;
-                    memcpy(jetson_msg.shelf_mac, msg.sender_mac, MAC_ADDRESS_LENGTH);
-                    jetson_msg.slot_id = (uint8_t)cJSON_GetNumberValue(slot_id_obj);
-                    jetson_msg.weight_g = cJSON_GetNumberValue(delta_g_obj);
-
-                    if (!are_doors_closed()) {
-                        if (xQueueSend(jetson_q, &jetson_msg, pdMS_TO_TICKS(10))) {
-
-                        } else {
-                            ESP_LOGW(func_tag, "Unable to add message to jetson queue. Is it full?");
-                        }
-                    }
-                }
-            }
-
-            char position[SM_POSITION_BUFFER_SIZE] = "";
-            // Check for position update
-            if (cJSON_HasObjectItem(json, "position")) {
-                cJSON* position_obj = cJSON_GetObjectItem(json, "position");
-                char* position_str = cJSON_GetStringValue(position_obj);
-                strcpy(position, position_str);
-            }
-
-
-            // Update shelf manager with this shelf
+            // Liveness bookkeeping stays unconditional and independent of
+            // the ack system: it fires for every received frame (including
+            // ACK/ACK_ACK), using an empty position here. The real position
+            // is only known once BNB_MSG_SHELF_STATUS JSON is parsed, which
+            // now happens in atlas_on_message_delivered, so that callback
+            // makes a second sm_update_shelf_time call to refine it.
             if (!sm_is_shelf_connected(msg.sender_mac)) {
-                sm_add_shelf(msg.sender_mac, msg.recv_time, position);
+                sm_add_shelf(msg.sender_mac, msg.recv_time, "");
 
                 // Add ESP-NOW peer (Atlas)
                 esp_now_peer_info_t en_peer_info = {
@@ -287,9 +316,8 @@ _Noreturn void esp_now_task(void *pvParameter) {
                 }
 
             } else {
-                sm_update_shelf_time(msg.sender_mac, msg.recv_time, position);
+                sm_update_shelf_time(msg.sender_mac, msg.recv_time, "");
             }
-            cJSON_Delete(json);
         }
         vTaskDelay(pdMS_TO_TICKS(25));
     }
@@ -763,17 +791,13 @@ void task_send_calibration_to_shelf(void* pvParameters) {
     cJSON_AddNumberToObject(json, "weight_g", info->weight_g);
     // Create string data from JSON
     char *data = cJSON_PrintUnformatted(json);
-    // Encode into a checksummed envelope and send to peer
-    uint8_t envelope[BNB_PROTOCOL_MAX_ENVELOPE_LEN];
-    size_t envelope_len;
-    esp_err_t enc_err = bnb_protocol_encode(BNB_MSG_CALIBRATION, data, strlen(data),
-                                             envelope, sizeof(envelope), &envelope_len);
-    if (enc_err == ESP_OK) {
-        esp_now_send(info->mac_address, envelope, envelope_len);
-    } else {
-        ESP_LOGE(TAG, "Failed to encode calibration envelope: %s", esp_err_to_name(enc_err));
+    // Queue for reliable (QoS2) delivery to the peer
+    esp_err_t send_err = bnb_ack_send_reliable(info->mac_address, BNB_MSG_CALIBRATION, data, strlen(data));
+    if (send_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to queue reliable calibration send: %s", esp_err_to_name(send_err));
     }
     // Free data
+    free(data);
     cJSON_Delete(json);
     free(info);
     vTaskDelete(NULL);
@@ -796,18 +820,14 @@ void task_send_position_to_shelf(void* pvParameters) {
     // Create string data from JSON
     char *data = cJSON_PrintUnformatted(json);
 
-    // Encode into a checksummed envelope and send to peer
-    uint8_t envelope[BNB_PROTOCOL_MAX_ENVELOPE_LEN];
-    size_t envelope_len;
-    esp_err_t enc_err = bnb_protocol_encode(BNB_MSG_POSITION_SET, data, strlen(data),
-                                             envelope, sizeof(envelope), &envelope_len);
-    if (enc_err == ESP_OK) {
-        esp_now_send(info->mac_address, envelope, envelope_len);
-    } else {
-        ESP_LOGE(TAG, "Failed to encode position envelope: %s", esp_err_to_name(enc_err));
+    // Queue for reliable (QoS2) delivery to the peer
+    esp_err_t send_err = bnb_ack_send_reliable(info->mac_address, BNB_MSG_POSITION_SET, data, strlen(data));
+    if (send_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to queue reliable position send: %s", esp_err_to_name(send_err));
     }
 
     // Free data
+    free(data);
     cJSON_Delete(json);
     free(info);
     vTaskDelete(NULL);
@@ -1010,6 +1030,7 @@ void app_main(void)
     init_leds();
     ESP_LOGD(TAG, "Initialized LEDs");
     sm_init();
+    bnb_ack_init(MAX_NUM_SHELVES, atlas_on_transmit, atlas_on_message_delivered, atlas_on_message_failed, NULL);
 
     // Schedule LEDs control task
     xTaskCreate(update_leds_task, "update_leds_task", 4096, NULL, 4, NULL);
