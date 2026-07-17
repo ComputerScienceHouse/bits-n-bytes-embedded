@@ -14,6 +14,7 @@
 #include "cJSON.h"
 #include "math.h"
 #include "esp_timer.h"
+#include "bnb_protocol.h"
 
 // Slots
 #define NUM_SLOTS 4
@@ -59,7 +60,7 @@ slot_t *slots = NULL;
 SemaphoreHandle_t slots_lock;
 
 // TODO remove atlas mac, this should not be hardcoded
-uint8_t atlas_mac[ESP_NOW_ETH_ALEN] = {0x30, 0xC6, 0xF7, 0x29, 0xE1, 0x90};
+uint8_t atlas_mac[ESP_NOW_ETH_ALEN] = {0x30, 0xC6, 0xF7, 0x2A, 0x0A, 0xE8};
 
 // String to store this device's mac address
 static char mac_address_str[18];
@@ -352,6 +353,9 @@ void update_position_task(void* pvParameters) {
     }
     new_position[strlen(new_position_mixed_case)] = '\0';
 
+    // Done reading pvParameters; free the heap copy the caller allocated for this task
+    free(pvParameters);
+
     // Get position lock
     while (!xSemaphoreTake(position_lock, pdMS_TO_TICKS(5000))) {
         ESP_LOGW(tag, "Failed to take position lock, retrying");
@@ -410,6 +414,8 @@ void update_position_task(void* pvParameters) {
 
         // Store new position in global state
         strcpy(position, new_position);
+
+        ESP_LOGD(tag, "Updated position to %s", position);
     } else {
         ESP_LOGW(tag, "Received invalid position: '%s', can't swap to this.", new_position);
     }
@@ -432,7 +438,24 @@ _Noreturn void process_esp_now_msg_task(void* pvParameters) {
 
         // Get next message from the queue
         if (xQueueReceive(esp_now_queue, &msg, portMAX_DELAY)) {
-            cJSON *json = cJSON_Parse(msg.data);
+
+            // Decode and checksum-validate the envelope before touching the payload
+            bnb_msg_type_t msg_type;
+            uint8_t payload[BNB_PROTOCOL_MAX_PAYLOAD_LEN];
+            size_t payload_len;
+            esp_err_t decode_err = bnb_protocol_decode((uint8_t*)msg.data, msg.length, &msg_type,
+                                                         payload, sizeof(payload), &payload_len);
+            if (decode_err != ESP_OK) {
+                ESP_LOGW(TAG, "Dropping ESP-NOW message that failed to decode: %s", esp_err_to_name(decode_err));
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            // Payload is not guaranteed to be NUL-terminated by the envelope; make it a C string for cJSON
+            char payload_str[BNB_PROTOCOL_MAX_PAYLOAD_LEN + 1];
+            memcpy(payload_str, payload, payload_len);
+            payload_str[payload_len] = '\0';
+
+            cJSON *json = cJSON_Parse(payload_str);
 
             // Make sure the slot_id and the weight_g exist
             if (cJSON_HasObjectItem(json, "slot_id") && cJSON_HasObjectItem(json, "weight_g")) {
@@ -489,8 +512,16 @@ _Noreturn void process_esp_now_msg_task(void* pvParameters) {
                 if (cJSON_IsString(position_obj)) {
                     char* position_value = cJSON_GetStringValue(position_obj);
 
-                    // Save position to machine
-                    xTaskCreate(update_position_task, "update_position_task", 4096, position_value, 4, NULL);
+                    // Give update_position_task its own copy: position_value points into
+                    // json's buffer, which cJSON_Delete below frees before the (lower-priority)
+                    // task below ever gets scheduled to read it.
+                    char* position_copy = strdup(position_value);
+                    if (position_copy == NULL) {
+                        ESP_LOGE(TAG, "Failed to allocate memory for position update");
+                    } else {
+                        // Save position to machine; update_position_task frees position_copy
+                        xTaskCreate(update_position_task, "update_position_task", 4096, position_copy, 4, NULL);
+                    }
 
                 } else {
                     ESP_LOGW(TAG, "Received non-string position value");
@@ -687,11 +718,21 @@ _Noreturn void send_weights_task(void* pvParameters) {
             cJSON_AddNumberToObject(json, "delta_g", msg.delta);
         }
 
-        // Send JSON data to Atlas ESP32
+        // Encode into a checksummed envelope and send to Atlas ESP32
         char *json_string = cJSON_PrintUnformatted(json);
         if (json_string != NULL) {
-            size_t json_len = strlen(json_string);
-            esp_now_send(atlas_mac, (uint8_t *) json_string, json_len);
+            uint8_t envelope[BNB_PROTOCOL_MAX_ENVELOPE_LEN];
+            size_t envelope_len;
+            esp_err_t enc_err = bnb_protocol_encode(BNB_MSG_SHELF_STATUS, json_string, strlen(json_string),
+                                                     envelope, sizeof(envelope), &envelope_len);
+            if (enc_err == ESP_OK) {
+                esp_err_t send_err = esp_now_send(atlas_mac, envelope, envelope_len);
+                if (send_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to send message over ESP-NOW");
+                }
+            } else {
+                ESP_LOGE(TAG, "Failed to encode shelf status envelope: %s", esp_err_to_name(enc_err));
+            }
             free(json_string);
         } else {
             ESP_LOGE(TAG, "Failed to serialize JSON. Free heap: %lu", esp_get_free_heap_size());

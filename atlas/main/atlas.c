@@ -26,6 +26,7 @@
 #include "fans.h"
 #include "shelf_manager.h"
 #include <esp_mac.h>
+#include "bnb_protocol.h"
 
 // Pins
 #define INTERNAL_LED_PIN 2
@@ -215,8 +216,24 @@ _Noreturn void esp_now_task(void *pvParameter) {
 
         if (xQueueReceive(esp_now_q, &msg, portMAX_DELAY)) {
 
+            // Decode and checksum-validate the envelope before touching the payload
+            bnb_msg_type_t msg_type;
+            uint8_t payload[BNB_PROTOCOL_MAX_PAYLOAD_LEN];
+            size_t payload_len;
+            esp_err_t decode_err = bnb_protocol_decode(msg.data, msg.len, &msg_type,
+                                                         payload, sizeof(payload), &payload_len);
+            if (decode_err != ESP_OK) {
+                ESP_LOGW(func_tag, "Dropping ESP-NOW message that failed to decode: %s", esp_err_to_name(decode_err));
+                vTaskDelay(pdMS_TO_TICKS(25));
+                continue;
+            }
+            // Payload is not guaranteed to be NUL-terminated by the envelope; make it a C string for cJSON
+            char payload_str[BNB_PROTOCOL_MAX_PAYLOAD_LEN + 1];
+            memcpy(payload_str, payload, payload_len);
+            payload_str[payload_len] = '\0';
+
             // Make sure slots field exists
-            cJSON* json = cJSON_Parse((char*)msg.data);
+            cJSON* json = cJSON_Parse(payload_str);
 
             // Check for slot update
             if (cJSON_HasObjectItem(json, "slot_id") && cJSON_HasObjectItem(json, "delta_g")) {
@@ -746,8 +763,16 @@ void task_send_calibration_to_shelf(void* pvParameters) {
     cJSON_AddNumberToObject(json, "weight_g", info->weight_g);
     // Create string data from JSON
     char *data = cJSON_PrintUnformatted(json);
-    // Send JSON to peer
-    esp_now_send(info->mac_address, (uint8_t*)data, strlen(data) + 1);
+    // Encode into a checksummed envelope and send to peer
+    uint8_t envelope[BNB_PROTOCOL_MAX_ENVELOPE_LEN];
+    size_t envelope_len;
+    esp_err_t enc_err = bnb_protocol_encode(BNB_MSG_CALIBRATION, data, strlen(data),
+                                             envelope, sizeof(envelope), &envelope_len);
+    if (enc_err == ESP_OK) {
+        esp_now_send(info->mac_address, envelope, envelope_len);
+    } else {
+        ESP_LOGE(TAG, "Failed to encode calibration envelope: %s", esp_err_to_name(enc_err));
+    }
     // Free data
     cJSON_Delete(json);
     free(info);
@@ -758,20 +783,29 @@ void task_send_calibration_to_shelf(void* pvParameters) {
  * Send a position swap request to a shelf.
  * @param pvParameters a void* to a shelf_position_data_t
  */
-void task_send_calibration(void* pvParameters) {
-    ESP_LOGI(TAG, "Sending position to shelf");
+void task_send_position_to_shelf(void* pvParameters) {
 
     shelf_position_data_t *info = (shelf_position_data_t*)pvParameters;
 
     // Construct JSON
     cJSON* json = cJSON_CreateObject();
     cJSON_AddStringToObject(json, "position", info->position);
+    ESP_LOGD(TAG, "Sending position to shelf: %s", info->position);
+
 
     // Create string data from JSON
     char *data = cJSON_PrintUnformatted(json);
 
-    // Send JSON to peer
-    esp_now_send(info->mac_address, (uint8_t*)data, strlen(data) + 1);
+    // Encode into a checksummed envelope and send to peer
+    uint8_t envelope[BNB_PROTOCOL_MAX_ENVELOPE_LEN];
+    size_t envelope_len;
+    esp_err_t enc_err = bnb_protocol_encode(BNB_MSG_POSITION_SET, data, strlen(data),
+                                             envelope, sizeof(envelope), &envelope_len);
+    if (enc_err == ESP_OK) {
+        esp_now_send(info->mac_address, envelope, envelope_len);
+    } else {
+        ESP_LOGE(TAG, "Failed to encode position envelope: %s", esp_err_to_name(enc_err));
+    }
 
     // Free data
     cJSON_Delete(json);
@@ -817,19 +851,16 @@ _Noreturn void read_from_pi_task() {
 
 
                 // Check if doors need to be opened
-                if (!cJSON_IsBool(doors_item)) {
-                    ESP_LOGW(tag, "JSON value for 'doors' is not a boolean.");
-                } else {
+                if (cJSON_IsBool(doors_item)) {
                     if (doors_item->valueint == 1) {
                         // Schedule call to open doors
                         xTaskCreate(open_doors_task, "open_doors_task", 2048, NULL, 4, NULL);
                     }
                 }
 
+
                 // Check if hatch needs to be opened
-                if (!cJSON_IsBool(hatch_item)) {
-                    ESP_LOGW(tag, "JSON value for 'hatch' is not a boolean.");
-                } else {
+                if (cJSON_IsBool(hatch_item)) {
                     if (hatch_item->valueint == 1) {
                         // Schedule call to open hatch
                         xTaskCreate(open_hatch_task, "open_hatch_task", 2048, NULL, 4, NULL);
@@ -845,6 +876,18 @@ _Noreturn void read_from_pi_task() {
                     cJSON *mac_entry = NULL;
                     cJSON_ArrayForEach(mac_entry, calibration_request) {
                         const char *shelf_mac_raw = mac_entry->string; // The key is the mac address
+                        // Convert mac address
+                        uint8_t *shelf_mac = malloc(sizeof(uint8_t) * MAC_ADDRESS_LENGTH);
+                        if (shelf_mac == NULL) {
+                            ESP_LOGE(tag, "Failed to allocate memory for shelf mac address!");
+                            goto free_json;
+                        }
+                        err = str_to_mac(shelf_mac_raw, shelf_mac);
+                        if (err != ESP_OK) {
+                            ESP_LOGE(tag, "Failed to convert mac address: %s", shelf_mac_raw);
+                            free(shelf_mac);
+                            goto free_json;
+                        }
 
                         // mac_entry itself is the array value for that MAC address
                         cJSON *item = NULL;
@@ -860,9 +903,6 @@ _Noreturn void read_from_pi_task() {
                                 int slot_id = (int) cJSON_GetNumberValue(slot_id_obj);
                                 double calibration_weight_g = (double) cJSON_GetNumberValue(weight_g_obj);
 
-                                // Convert mac address
-                                uint8_t *shelf_mac = malloc(sizeof(uint8_t) * MAC_ADDRESS_LENGTH);
-                                err = str_to_mac(shelf_mac_raw, shelf_mac);
                                 if (err != ESP_OK) {
                                     ESP_LOGE(TAG, "Unable to convert string MAC to uint8_t pointer");
                                 } else {
@@ -874,70 +914,24 @@ _Noreturn void read_from_pi_task() {
                                     xTaskCreate(task_send_calibration_to_shelf, "send_calibration_to_shelf", 4096,
                                                 (void *) calibration_data, 6, NULL);
                                 }
-                                free(shelf_mac);
-
                             } else if (cJSON_IsString(position_obj)) {
                                 // Type 2: Shelf info update
                                 char* position_str = cJSON_GetStringValue(position_obj);
+                                ESP_LOGD(tag, "New position str from pi: %s", position_str);
 
                                 // Make sure received position isn't too large for the buffer
                                 if (strlen(position_str) + 1 > SM_POSITION_BUFFER_SIZE) {
                                     ESP_LOGW(TAG, "Received shelf position that exceeds max buffer size");
                                 } else {
-                                    // TODO figure out how I'm going to tell shelves to flip their orientation
-
+                                    shelf_position_data_t *shelf_pos_data = malloc(sizeof(shelf_position_data_t));
+                                    memcpy(shelf_pos_data->mac_address, shelf_mac, MAC_ADDRESS_LENGTH);
+                                    strcpy(shelf_pos_data->position, position_str);
+                                    xTaskCreate(task_send_position_to_shelf, "send_position_to_shelf", 4096, (void*)shelf_pos_data, 6, NULL);
                                 }
                             } else {
                                 ESP_LOGE(tag, "Received invalid shelf update packet, neither type 1 (slot calibration) nor type 2 (shelf info) were found.");
                             }
                         }
-                    }
-
-
-
-
-                    // Make sure this calibration request has the correct fields
-                    if (
-                                cJSON_HasObjectItem(calibration_request, "shelf_id") &&
-                                    cJSON_HasObjectItem(calibration_request, "slot_id") &&
-                                    cJSON_HasObjectItem(calibration_request, "weight_g")
-                            ) {
-                        // Extract all fields
-                        char *shelf_mac_raw = cJSON_GetStringValue(cJSON_GetObjectItem(calibration_request, "shelf_id"));
-
-                        cJSON* slot_id_obj = cJSON_GetObjectItem(calibration_request, "slot_id");
-                        cJSON* calibration_weight_obj = cJSON_GetObjectItem(calibration_request, "weight_g");
-                        if (!cJSON_IsNumber(slot_id_obj) || !cJSON_IsNumber(calibration_weight_obj)) {
-                            // One of the fields is not a number
-                            if (!cJSON_IsNumber(slot_id_obj)) {
-                                ESP_LOGE(tag, "Received slot_id that is not a number");
-                            }
-                            if (!cJSON_IsNumber(calibration_weight_obj)) {
-                                ESP_LOGE(tag, "Received weight_g that is not a number");
-                            }
-                        } else {
-                            int slot_id = (int) cJSON_GetNumberValue(slot_id_obj);
-
-                            double calibration_weight_g = (double) cJSON_GetNumberValue(calibration_weight_obj);
-
-                            // Convert mac address
-                            uint8_t *shelf_mac = malloc(sizeof(uint8_t) * MAC_ADDRESS_LENGTH);
-                            err = str_to_mac(shelf_mac_raw, shelf_mac);
-                            if (err != ESP_OK) {
-                                ESP_LOGE(TAG, "Unable to convert string MAC to uint8_t pointer");
-                            } else {
-                                // Send calibration data to the shelf
-                                shelf_calibration_data_t *calibration_data = malloc(sizeof(shelf_calibration_data_t));
-                                memcpy(calibration_data->mac_address, shelf_mac, MAC_ADDRESS_LENGTH);
-                                calibration_data->weight_g = calibration_weight_g;
-                                calibration_data->slot_id = slot_id;
-                                xTaskCreate(task_send_calibration_to_shelf, "send_calibration_to_shelf", 4096,
-                                            (void *) calibration_data, 6, NULL);
-                            }
-                            free(shelf_mac);
-                        }
-                    } else {
-                        ESP_LOGW(TAG, "Invalid calibration request");
                     }
                 }
             free_json:
