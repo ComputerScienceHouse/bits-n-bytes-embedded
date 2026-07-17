@@ -31,6 +31,7 @@ static const char* TAG = "shelf_manager";
 typedef struct {
     int64_t last_comms_mu_s;
     uint8_t mac_address[6];
+    char position[SM_POSITION_BUFFER_SIZE];
 } sm_shelf_t;
 
 // Array of active shelves
@@ -46,7 +47,7 @@ static TaskHandle_t sm_task_handle = NULL;
  * @param mac_address
  * @return esp_err_t
  */
-esp_err_t sm_add_shelf(uint8_t* mac_address, int64_t msg_recv_mu_s) {
+esp_err_t sm_add_shelf(uint8_t* mac_address, int64_t msg_recv_mu_s, char* position) {
 
     // Wait for access to the shelves array
     if (xSemaphoreTake(active_shelves_mutex, MAX_MUTEX_DELAY_TICKS)) {
@@ -66,6 +67,14 @@ esp_err_t sm_add_shelf(uint8_t* mac_address, int64_t msg_recv_mu_s) {
             memset(new_shelf, 0, sizeof(sm_shelf_t));
             new_shelf->last_comms_mu_s = msg_recv_mu_s;
             memcpy(new_shelf->mac_address, mac_address, MAC_ADDRESS_LENGTH);
+
+            if (strlen(position) == 0) {
+                // Default to 'right'
+                strcpy(new_shelf->position, "right");
+            } else {
+                strcpy(new_shelf->position, position);
+            }
+
 
             // Add new shelf pointer to list of shelves
             active_shelves[num_active_shelves] = new_shelf;
@@ -92,7 +101,7 @@ esp_err_t sm_add_shelf(uint8_t* mac_address, int64_t msg_recv_mu_s) {
  * @param msg_recv_mu_
  * @return
  */
-esp_err_t sm_update_shelf_time(uint8_t* mac_address, int64_t msg_recv_mu_s) {
+esp_err_t sm_update_shelf_time(uint8_t* mac_address, int64_t msg_recv_mu_s, char* position) {
     if (xSemaphoreTake(active_shelves_mutex, MAX_MUTEX_DELAY_TICKS)) {
         // Find the correct shelf
         bool found = false;
@@ -102,6 +111,11 @@ esp_err_t sm_update_shelf_time(uint8_t* mac_address, int64_t msg_recv_mu_s) {
                 // Update time
                 active_shelves[i]->last_comms_mu_s = msg_recv_mu_s;
                 found = true;
+
+                // Update position if new position was provided
+                if (strlen(position) > 0) {
+                    strcpy(active_shelves[i]->position, position);
+                }
                 break;
             }
         }
@@ -143,7 +157,7 @@ bool sm_is_shelf_connected(uint8_t* mac_address) {
  * with all uint8_t pointers contained within.
  * @return esp_err_t
  */
-esp_err_t sm_get_all_active_shelves_mac_addresses(uint8_t*** output, size_t *num_shelves) {
+esp_err_t sm_get_all_active_shelves_mac_and_pos(uint8_t*** output, size_t *num_shelves) {
 
     if (xSemaphoreTake(active_shelves_mutex, MAX_MUTEX_DELAY_TICKS)) {
 
@@ -153,7 +167,12 @@ esp_err_t sm_get_all_active_shelves_mac_addresses(uint8_t*** output, size_t *num
             return ESP_OK;
         }
 
-        *output = malloc(num_active_shelves * sizeof(uint8_t*));
+        // Array consisting of num_active_shelves * 2 pointers. Each shelf
+        // gets two pointers: one to the mac address, one to the position.
+        *output = malloc(
+            (num_active_shelves * sizeof(uint8_t*)) +
+            (num_active_shelves * sizeof(char*))
+        );
 
         if (*output == NULL) {
             xSemaphoreGive(active_shelves_mutex);
@@ -161,17 +180,31 @@ esp_err_t sm_get_all_active_shelves_mac_addresses(uint8_t*** output, size_t *num
         }
 
         for (size_t i = 0; i < num_active_shelves; i++) {
-            (*output)[i] = malloc(MAC_ADDRESS_LENGTH);
-            if ((*output)[i] == NULL) {
+            // Write mac address
+            (*output)[i * 2] = malloc(MAC_ADDRESS_LENGTH);
+            if ((*output)[i * 2] == NULL) {
                 // Clean up on failure
-                for (size_t j = 0; j < i; j++) {
+                for (size_t j = 0; j < i * 2; j++) {
                     free((*output)[j]);
                 }
                 free(*output);
                 xSemaphoreGive(active_shelves_mutex);
                 return ESP_ERR_NO_MEM;
             }
-            memcpy((*output)[i], active_shelves[i]->mac_address, MAC_ADDRESS_LENGTH);
+            // Write position address
+            (*output)[i * 2 + 1] = malloc(SM_POSITION_BUFFER_SIZE);
+            if ((*output)[i * 2 + 1] == NULL) {
+                // Clean up on failure
+                for (size_t j = 0; j < i * 2 + 1; j++) {
+                    free((*output)[j]);
+                }
+                free(*output);
+                xSemaphoreGive(active_shelves_mutex);
+                return ESP_ERR_NO_MEM;
+            }
+            // Copy values into allocated memory
+            memcpy((*output)[i * 2], active_shelves[i]->mac_address, MAC_ADDRESS_LENGTH);
+            memcpy((*output)[i * 2 + 1], active_shelves[i]->position, SM_POSITION_BUFFER_SIZE);
         }
         *num_shelves = num_active_shelves;
         xSemaphoreGive(active_shelves_mutex);
@@ -196,6 +229,8 @@ static esp_err_t sm_internal_remove_shelf(uint8_t *mac_address) {
         if (memcmp(active_shelves[i]->mac_address, mac_address, MAC_ADDRESS_LENGTH) == 0) {
             // Remove shelf
             free(active_shelves[i]);
+            free(active_shelves[i]);
+            active_shelves[i] = NULL;
             active_shelves[i] = NULL;
             num_active_shelves--;
             // Signal that removal happened

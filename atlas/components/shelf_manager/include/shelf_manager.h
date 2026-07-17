@@ -1,21 +1,25 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 
+#define SM_POSITION_BUFFER_SIZE 20
+
 /**
  * Add a new shelf.
  * @param mac_address
+ * @param position
  * @return esp_err_t
  */
-esp_err_t sm_add_shelf(uint8_t* mac_address, int64_t msg_recv_mu_s);
+esp_err_t sm_add_shelf(uint8_t* mac_address, int64_t msg_recv_mu_s, char* position);
 
 
 /**
  * Update the last time a shelf communicated.
  * @param mac_address
- * @param msg_recv_mu_
+ * @param msg_recv_mu_s
+ * @param position
  * @return
  */
-esp_err_t sm_update_shelf_time(uint8_t* mac_address, int64_t msg_recv_mu_s);
+esp_err_t sm_update_shelf_time(uint8_t* mac_address, int64_t msg_recv_mu_s, char* position);
 
 
 /**
@@ -24,7 +28,7 @@ esp_err_t sm_update_shelf_time(uint8_t* mac_address, int64_t msg_recv_mu_s);
  * with all uint8_t pointers contained within.
  * @return esp_err_t
  */
-esp_err_t sm_get_all_active_shelves_mac_addresses(uint8_t*** output, size_t *num_shelves);
+esp_err_t sm_get_all_active_shelves_mac_and_pos(uint8_t*** output, size_t *num_shelves);
 
 
 /**
