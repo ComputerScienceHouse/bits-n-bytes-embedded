@@ -615,7 +615,7 @@ _Noreturn void process_esp_now_msg_task(void* pvParameters) {
                     double weight_g = cJSON_GetNumberValue(weight_g_item);
 
                     // Make sure the slot is valid
-                    if (slot_id < NUM_SLOTS) {
+                    if (slot_id >= 0 && slot_id < NUM_SLOTS) {
                         double output = 1.0;
 
                         // slots[] can be swapped out from under us by update_position_task
