@@ -86,6 +86,23 @@ static const char* TAG = "shelf";
 SemaphoreHandle_t position_lock = NULL;
 char position[POSITION_BUFFER_SIZE];
 
+
+// Per-slot filtering/stability state. This is tied to the physical slot in the
+// same way slot_t is, so it must be protected by slots_lock and swapped alongside
+// slot_t whenever the shelf is flipped. Otherwise, a slot inherits stale history
+// from a different physical load cell after a flip.
+static double median_window[NUM_SLOTS][MEDIAN_FILTER_SIZE] = {0};
+static double average_window[NUM_SLOTS][ROLLING_AVERAGE_FILTER_SIZE] = {0};
+static size_t median_index[NUM_SLOTS] = {0};
+static size_t average_index[NUM_SLOTS] = {0};
+
+static int64_t last_value_time[NUM_SLOTS] = {0};
+static double last_stable_weight[NUM_SLOTS] = {0};
+static double last_average_value[NUM_SLOTS] = {0};
+static uint32_t stable_timer[NUM_SLOTS] = {0};
+static bool is_stable[NUM_SLOTS] = {false};
+
+
 /**
  * Configure GPIO pins
  */
@@ -395,29 +412,149 @@ void update_position_task(void* pvParameters) {
             goto end;
         }
 
-        // Write new position to NVS
-        err = nvs_set_str(nvs_handle, "position", new_position);
-        if (err != ESP_OK) {
-            ESP_LOGE(tag, "Failed to write to NVS to store updated position. This position will update will be ignored.");
+        // Read every pair's calibration values up front, before writing anything.
+        // This way a failed read never leaves NVS partially modified.
+        const size_t num_pairs = NUM_SLOTS / 2;
+        double left_values[NUM_SLOTS / 2];
+        double right_values[NUM_SLOTS / 2];
+        char left_keys[NUM_SLOTS / 2][20];
+        char right_keys[NUM_SLOTS / 2][20];
+        bool read_failed = false;
+        for (size_t left_p = 0; left_p < num_pairs; left_p++) {
+            const size_t right_p = NUM_SLOTS - 1 - left_p;
+            sprintf(left_keys[left_p], "slot_%d_cal", left_p);
+            sprintf(right_keys[left_p], "slot_%d_cal", right_p);
+
+            left_values[left_p] = 1.0;
+            size_t size = sizeof(double);
+            err = nvs_get_blob(nvs_handle, left_keys[left_p], &left_values[left_p], &size);
+            if (err != ESP_OK) {
+                ESP_LOGE(tag, "Failed to read slot calibration value from NVS");
+                read_failed = true;
+                break;
+            }
+            right_values[left_p] = 1.0;
+            size = sizeof(double);
+            err = nvs_get_blob(nvs_handle, right_keys[left_p], &right_values[left_p], &size);
+            if (err != ESP_OK) {
+                ESP_LOGE(tag, "Failed to read slot calibration value from NVS");
+                read_failed = true;
+                break;
+            }
+        }
+        if (read_failed) {
             nvs_close(nvs_handle);
             goto end;
         }
-        nvs_commit(nvs_handle);
-        nvs_close(nvs_handle);
 
-        // Wrote to NVS successfully, so now we can actually flip the shelves
+        // Write the new position and the swapped calibration values, tracking how far
+        // we got so that a failure partway through can be rolled back instead of
+        // leaving NVS and RAM permanently out of sync.
+        bool write_failed = false;
+        size_t pairs_written = 0;
+        bool right_written_for_last_pair = false;
+
+        err = nvs_set_str(nvs_handle, "position", new_position);
+        if (err != ESP_OK) {
+            ESP_LOGE(tag, "Failed to write to NVS to store updated position. This position update will be ignored.");
+            write_failed = true;
+        }
+
+        for (size_t left_p = 0; !write_failed && left_p < num_pairs; left_p++) {
+            err = nvs_set_blob(nvs_handle, left_keys[left_p], &right_values[left_p], sizeof(double));
+            if (err != ESP_OK) {
+                ESP_LOGE(tag, "Failed to set slot calibration value in NVS when swapping");
+                write_failed = true;
+                break;
+            }
+            err = nvs_set_blob(nvs_handle, right_keys[left_p], &left_values[left_p], sizeof(double));
+            if (err != ESP_OK) {
+                ESP_LOGE(tag, "Failed to set slot calibration value in NVS when swapping");
+                write_failed = true;
+                right_written_for_last_pair = false;
+                break;
+            }
+            right_written_for_last_pair = true;
+            pairs_written++;
+        }
+
+        if (write_failed) {
+            // Roll back every key we already changed so NVS ends up exactly as it
+            // was before this flip was attempted.
+            ESP_LOGE(tag, "Flip failed partway through, rolling back NVS changes");
+            nvs_set_str(nvs_handle, "position", position);
+            for (size_t left_p = 0; left_p < pairs_written; left_p++) {
+                nvs_set_blob(nvs_handle, left_keys[left_p], &left_values[left_p], sizeof(double));
+                nvs_set_blob(nvs_handle, right_keys[left_p], &right_values[left_p], sizeof(double));
+            }
+            // If we got partway through the failing pair (left key already swapped
+            // but the right key's write failed), undo that key too.
+            if (!right_written_for_last_pair && pairs_written < num_pairs) {
+                nvs_set_blob(nvs_handle, left_keys[pairs_written], &left_values[pairs_written], sizeof(double));
+            }
+            nvs_commit(nvs_handle);
+            nvs_close(nvs_handle);
+            goto end;
+        }
+
+        // Every NVS write succeeded, so it's safe to flip the in-memory state to match.
 
         // Only iterate through half because we're swapping the lower half of
         // pointers with the upper half. For an odd number of slots, the middle
         // does not need to be swapped at all, therefore the floor (a byproduct
         // of integer division) is the right calculation.
-        for (size_t left_p = 0; left_p < NUM_SLOTS / 2; left_p++) {
+        for (size_t left_p = 0; left_p < num_pairs; left_p++) {
             const size_t right_p = NUM_SLOTS - 1 - left_p;
-            // Do the swap
+
+            // Swap the slot itself (calibration state + hx711 pointers).
             const slot_t temp = slots[left_p];
             slots[left_p] = slots[right_p];
             slots[right_p] = temp;
+
+            // Swap the per-slot filter/stability state so it stays with the
+            // physical load cell it was tracking, not the array index.
+            double median_temp[MEDIAN_FILTER_SIZE];
+            memcpy(median_temp, median_window[left_p], sizeof(median_temp));
+            memcpy(median_window[left_p], median_window[right_p], sizeof(median_temp));
+            memcpy(median_window[right_p], median_temp, sizeof(median_temp));
+
+            double average_temp[ROLLING_AVERAGE_FILTER_SIZE];
+            memcpy(average_temp, average_window[left_p], sizeof(average_temp));
+            memcpy(average_window[left_p], average_window[right_p], sizeof(average_temp));
+            memcpy(average_window[right_p], average_temp, sizeof(average_temp));
+
+            size_t size_temp = median_index[left_p];
+            median_index[left_p] = median_index[right_p];
+            median_index[right_p] = size_temp;
+
+            size_temp = average_index[left_p];
+            average_index[left_p] = average_index[right_p];
+            average_index[right_p] = size_temp;
+
+            int64_t time_temp = last_value_time[left_p];
+            last_value_time[left_p] = last_value_time[right_p];
+            last_value_time[right_p] = time_temp;
+
+            double double_temp = last_stable_weight[left_p];
+            last_stable_weight[left_p] = last_stable_weight[right_p];
+            last_stable_weight[right_p] = double_temp;
+
+            double_temp = last_average_value[left_p];
+            last_average_value[left_p] = last_average_value[right_p];
+            last_average_value[right_p] = double_temp;
+
+            uint32_t timer_temp = stable_timer[left_p];
+            stable_timer[left_p] = stable_timer[right_p];
+            stable_timer[right_p] = timer_temp;
+
+            bool stable_temp = is_stable[left_p];
+            is_stable[left_p] = is_stable[right_p];
+            is_stable[right_p] = stable_temp;
         }
+
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+
 
         // Store new position in global state
         strcpy(position, new_position);
@@ -481,32 +618,42 @@ _Noreturn void process_esp_now_msg_task(void* pvParameters) {
                     if (slot_id < NUM_SLOTS) {
                         double output = 1.0;
 
-                        double current_raw = slots[slot_id].current_raw;
+                        // slots[] can be swapped out from under us by update_position_task
+                        // during a flip, so it must only be touched while holding slots_lock.
+                        if (xSemaphoreTake(slots_lock, pdMS_TO_TICKS(5000)) == pdTRUE) {
+                            double current_raw = slots[slot_id].current_raw;
 
-                        // Calculate the conversion factor
-                        esp_err_t err = calc_conversion_factor(slots[slot_id].calibration_previous_raw, current_raw, weight_g, &output);
+                            // Calculate the conversion factor
+                            esp_err_t err = calc_conversion_factor(slots[slot_id].calibration_previous_raw, current_raw, weight_g, &output);
 
-                        if (err == ESP_OK) {
-                            slots[slot_id].calibration_factor = output;
-                            ESP_LOGI(TAG, "Set calibration factor to %.5f", output);
-                            // Write to NVS
-                            nvs_handle_t nvs_handle;
-                            err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
-                            if (err != ESP_OK) {
-                                ESP_LOGW(TAG, "Failed to open NVS to write new calibration value to NVS");
-                            } else {
-                                char storage_key[30];
-                                sprintf(storage_key, "slot_%d_cal", slot_id);
-                                size_t size = sizeof(output);
-                                err = nvs_set_blob(nvs_handle, storage_key, &output, size);
-                                if (err != ESP_OK) {
-                                    ESP_LOGW(TAG, "Failed to store new calibration value in NVS");
-                                }
-                                nvs_commit(nvs_handle);
-                                nvs_close(nvs_handle);
+                            if (err == ESP_OK) {
+                                slots[slot_id].calibration_factor = output;
+                                slots[slot_id].calibration_previous_raw = current_raw;
                             }
-                            slots[slot_id].calibration_previous_raw = current_raw;
-                            ESP_LOGI(TAG, "Successfully tared");
+                            xSemaphoreGive(slots_lock);
+
+                            if (err == ESP_OK) {
+                                ESP_LOGI(TAG, "Set calibration factor to %.5f", output);
+                                // Write to NVS
+                                nvs_handle_t nvs_handle;
+                                err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
+                                if (err != ESP_OK) {
+                                    ESP_LOGW(TAG, "Failed to open NVS to write new calibration value to NVS");
+                                } else {
+                                    char storage_key[30];
+                                    sprintf(storage_key, "slot_%d_cal", slot_id);
+                                    size_t size = sizeof(output);
+                                    err = nvs_set_blob(nvs_handle, storage_key, &output, size);
+                                    if (err != ESP_OK) {
+                                        ESP_LOGW(TAG, "Failed to store new calibration value in NVS");
+                                    }
+                                    nvs_commit(nvs_handle);
+                                    nvs_close(nvs_handle);
+                                }
+                                ESP_LOGI(TAG, "Successfully tared");
+                            }
+                        } else {
+                            ESP_LOGW(TAG, "Failed to take slots lock, dropping calibration update");
                         }
                     } else {
                         ESP_LOGW(TAG, "Received slot ID exceeding max number of slots on this shelf");
@@ -586,20 +733,8 @@ static double get_average_weight(const double *vals) {
     return sum / (double)ROLLING_AVERAGE_FILTER_SIZE;
 }
 
-static double median_window[NUM_SLOTS][MEDIAN_FILTER_SIZE] = {0};
-static double average_window[NUM_SLOTS][ROLLING_AVERAGE_FILTER_SIZE] = {0};
-static size_t median_index[NUM_SLOTS] = {0};
-static size_t average_index[NUM_SLOTS] = {0};
-
-static int64_t last_value_time[NUM_SLOTS] = {0};
-static double last_stable_weight[NUM_SLOTS] = {0};
-static double last_average_value[NUM_SLOTS] = {0};
-static uint32_t stable_timer[NUM_SLOTS] = {0};
-static bool is_stable[NUM_SLOTS] = {false};
-
-
 /**
- *
+ * Task for pulling the weights from the load cells
  * @param pvParameters
  * @return
  */
@@ -612,8 +747,22 @@ void poll_weights_task(void *pvParameters) {
         for (size_t slot_i = 0; slot_i < NUM_SLOTS; slot_i++) {
             int64_t time = esp_timer_get_time() / 1000;
             int32_t upper, lower;
-            bool lower_ok = read_load_cell_data(slots[slot_i].lower_load_cell, &lower) == ESP_OK;
-            bool upper_ok = read_load_cell_data(slots[slot_i].upper_load_cell, &upper) == ESP_OK;
+
+            // slots[] can be swapped out from under us by update_position_task during
+            // a flip, so grab the load cell pointers under the lock. The hx711_t
+            // objects themselves never move/free, only which slot_t owns them, so it's
+            // safe to release the lock before doing the (potentially slow) hardware read.
+            hx711_t *upper_lc, *lower_lc;
+            if (xSemaphoreTake(slots_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                ESP_LOGW(func_tag, "Failed to take slots lock, skipping slot %d this cycle", slot_i);
+                continue;
+            }
+            upper_lc = slots[slot_i].upper_load_cell;
+            lower_lc = slots[slot_i].lower_load_cell;
+            xSemaphoreGive(slots_lock);
+
+            bool lower_ok = read_load_cell_data(lower_lc, &lower) == ESP_OK;
+            bool upper_ok = read_load_cell_data(upper_lc, &upper) == ESP_OK;
             if (!lower_ok || !upper_ok) {
                 if (!lower_ok && !upper_ok) {
                     ESP_LOGW(func_tag, "Error reading both load cells in slot %d", slot_i);
@@ -623,6 +772,15 @@ void poll_weights_task(void *pvParameters) {
                     ESP_LOGW(func_tag, "Error reading lower load cell in slot %d", slot_i);
                 }
             } else {
+                // slots[slot_i].calibration_factor and the per-slot filter/stability
+                // state must also be read/updated under the lock, since a flip swaps
+                // them as a unit and a torn view would pair the wrong calibration
+                // factor or history with this reading.
+                if (xSemaphoreTake(slots_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                    ESP_LOGW(func_tag, "Failed to take slots lock, dropping reading for slot %d", slot_i);
+                    continue;
+                }
+
                 // Calculate weight in grams using calibration factor
                 double raw_weight_total = (double)(upper + lower);
                 slots[slot_i].current_raw = raw_weight_total;
@@ -645,6 +803,9 @@ void poll_weights_task(void *pvParameters) {
                 // STABILITY BASED DELTA DETECTION
                 double diff = fabs(average_weight_g - last_average_value[slot_i]);
 
+                bool send_delta = false;
+                double delta = 0.0;
+
                 if (diff > STABLE_THRESHOLD) {
                     // Weight changing -> user is grabbing/dropping -> ignore
                     stable_timer[slot_i] = 0;
@@ -658,27 +819,32 @@ void poll_weights_task(void *pvParameters) {
                         // New stable weight detected
                         is_stable[slot_i] = true;
                         stable_timer[slot_i] = 0;
-                        ESP_LOGW(func_tag, "stable weight detected (slot %d)", slot_i);
+                        ESP_LOGI(func_tag, "stable weight detected (slot %d)", slot_i);
 
                         double new_weight = average_weight_g;
-                        double delta = new_weight - last_stable_weight[slot_i];
+                        delta = new_weight - last_stable_weight[slot_i];
 
                         // Only send meaningful data
-                        if (fabs(delta) > STABLE_THRESHOLD) {
-                            delta_msg_t msg;
-                            msg.delta = delta;
-                            msg.slot_id = slot_i;
-                            if(xQueueSend(delta_msg_queue, &msg, portMAX_DELAY)) {
-                                ESP_LOGD(func_tag, "Slot %d: Added delta %.5f to queue ", slot_i, delta);
-                            } else {
-                                ESP_LOGE(func_tag, "Unable to add delta weight to queue!");
-                            }
-                        }
+                        send_delta = fabs(delta) > STABLE_THRESHOLD;
                         last_stable_weight[slot_i] = new_weight;
                     }
                 }
                 last_average_value[slot_i] = average_weight_g;
                 last_value_time[slot_i] = time;
+
+                xSemaphoreGive(slots_lock);
+
+                // Enqueueing can block (portMAX_DELAY), so do it outside the lock.
+                if (send_delta) {
+                    delta_msg_t msg;
+                    msg.delta = delta;
+                    msg.slot_id = slot_i;
+                    if(xQueueSend(delta_msg_queue, &msg, portMAX_DELAY)) {
+                        ESP_LOGD(func_tag, "Slot %d: Added delta %.5f to queue ", slot_i, delta);
+                    } else {
+                        ESP_LOGE(func_tag, "Unable to add delta weight to queue!");
+                    }
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(POLLING_DELAY_MS));
