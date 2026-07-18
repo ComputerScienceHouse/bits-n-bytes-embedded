@@ -182,6 +182,13 @@ bool is_hatch_closed() {
  * @param len
  */
 void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+
+    // Compare against broadcast MAC to ignore broadcast messages
+    uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    if (memcmp(info->des_addr, broadcastMac, 6) == 0) {
+        return;
+    }
+
     // Check if any data was sent
     if (!data || len <= 0) return;
 

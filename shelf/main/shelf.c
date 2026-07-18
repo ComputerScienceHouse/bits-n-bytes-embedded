@@ -296,6 +296,13 @@ void load_persistent_data() {
 
 
 void esp_now_message_received_isr(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+
+    // Compare against broadcast MAC to ignore broadcast messages
+    uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    if (memcmp(info->des_addr, broadcastMac, 6) == 0) {
+        return;
+    }
+    
     // Check if any data was received
     if (!data || len <= 0) return;
 
